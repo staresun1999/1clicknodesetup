@@ -5,6 +5,7 @@
 #    [1] VLESS + TCP + XTLS-Vision + REALITY（Xray-core）
 #    [2] Hysteria 2（ACME 自动证书 / 自签名证书）
 #    [3] AnyTLS（sing-box 内核；ACME 自动证书 / 自签名证书）
+#    另含：[4] 查看已有节点配置   [5] 删除已搭建的节点（卸载并清理干净）
 #  支持系统：Ubuntu 20.04/22.04/24.04 | Debian 10/11/12
 #            CentOS / Rocky / AlmaLinux（仅 Hysteria 2 / AnyTLS）
 # ============================================================
@@ -90,15 +91,19 @@ show_main_menu() {
     echo ""
     echo "    [4]  查看当前已有节点配置"
     echo ""
+    echo "    [5]  删除已搭建的节点"
+    echo "         (卸载服务，清理程序 / 配置 / 证书 / 日志，删干净)"
+    echo ""
     echo "    [0]  退出"
     echo ""
-    read -rp "  请输入 [0/1/2/3/4]（默认 1）: " PROTO_CHOICE
+    read -rp "  请输入 [0/1/2/3/4/5]（默认 1）: " PROTO_CHOICE
     PROTO_CHOICE=${PROTO_CHOICE:-1}
     case "$PROTO_CHOICE" in
         1) install_reality; return ;;
         2) install_hysteria2; return ;;
         3) install_anytls; return ;;
         4) show_existing_configs ;;
+        5) delete_nodes ;;
         0) echo ""; info "已退出。"; exit 0 ;;
         *) warn "无效选项，请重新运行脚本"; exit 1 ;;
     esac
@@ -245,6 +250,17 @@ show_hy2_existing_config() {
     [[ -n "$ca" ]] && printf "  ${BOLD}ACME CA${NC}:    %s\n" "$ca"
     [[ -n "$cert_file" ]] && printf "  ${BOLD}证书${NC}:       %s\n" "$cert_file"
 
+    local bw_up bw_down
+    bw_up=$(awk '/^bandwidth:/{f=1;next} f&&/^[^[:space:]]/{exit} f&&/^[[:space:]]+up:/{print $2" "$3; exit}' "$config" 2>/dev/null || true)
+    bw_down=$(awk '/^bandwidth:/{f=1;next} f&&/^[^[:space:]]/{exit} f&&/^[[:space:]]+down:/{print $2" "$3; exit}' "$config" 2>/dev/null || true)
+    if [[ -n "$bw_up" || -n "$bw_down" ]]; then
+        printf "  ${BOLD}带宽限制${NC}:   服务端 up %s / down %s\n" "${bw_up:-不限}" "${bw_down:-不限}"
+        printf "              ${DIM}（方向相反：服务端 up = 客户端下载，服务端 down = 客户端上传）${NC}\n"
+    fi
+    if grep -qE '^[[:space:]]*disablePathMTUDiscovery:[[:space:]]*true' "$config"; then
+        printf "  ${BOLD}MTU 探测${NC}:   已关闭\n"
+    fi
+
     server_ipv4=$(hy2_get_ipv4 2>/dev/null || true)
     server_ipv6=$(hy2_get_ipv6 2>/dev/null || true)
     echo ""
@@ -344,12 +360,31 @@ re_detect_os() {
 
 # ────────────────────────────────────────────────────────────
 #  安装依赖（REALITY）
+#  注意：第三方 apt 源（如已失效的 Caddy 源）导致 apt-get update
+#  返回非零时，不应中断安装，继续使用现有缓存即可。
 # ────────────────────────────────────────────────────────────
 re_install_deps() {
     step "安装依赖"
-    apt-get update -qq
+
+    local i update_ok=0
+    for i in 1 2; do
+        if apt-get update -qq; then
+            update_ok=1
+            break
+        fi
+        warn "apt-get update 返回错误（可能是某个第三方源失效，如 Caddy / Cloudsmith），重试 (${i}/2)..."
+        sleep 2
+    done
+    (( update_ok == 0 )) && warn "apt-get update 存在失败的源，已忽略，继续使用现有软件包缓存安装依赖"
+
     apt-get install -y -qq curl wget unzip jq qrencode 2>/dev/null || \
-        apt-get install -y -qq curl wget unzip jq
+        apt-get install -y -qq curl wget unzip jq \
+        || error "依赖安装失败。若是 apt 源问题，可临时禁用出错的源后重试，例如: mv /etc/apt/sources.list.d/caddy-stable.list /root/ && apt-get update"
+
+    local c
+    for c in curl unzip jq; do
+        command -v "$c" &>/dev/null || error "缺少依赖命令: ${c}"
+    done
     info "依赖安装完成"
 }
 
@@ -722,6 +757,11 @@ HY2_ACME_DIR="${HY2_CONF_DIR}/acme"
 _FP_B64=""
 _FP_COLON=""
 
+# 全局：带宽限制（按「客户端实际速度」记录，单位 Mbps，0 = 不限速）与 MTU 探测开关
+HY2_UL_MBPS=50     # 客户端上传
+HY2_DL_MBPS=200    # 客户端下载
+HY2_NO_PMTUD=0     # 1 = 关闭 QUIC 路径 MTU 探测
+
 # ────────────────────────────────────────────────────────────
 #  检测是否已安装
 # ────────────────────────────────────────────────────────────
@@ -944,6 +984,89 @@ hy2_gen_selfsigned_cert() {
 }
 
 # ────────────────────────────────────────────────────────────
+#  带宽限制 / MTU 探测：交互询问
+#  注意方向：服务端配置里的 up/down 与客户端相反
+#    服务端 up（发出）= 客户端下载；服务端 down（接收）= 客户端上传
+#  这里按「客户端实际速度」询问，写服务端配置时自动对调
+# ────────────────────────────────────────────────────────────
+hy2_ask_limits() {
+    local v
+    echo ""
+    echo -e "  ${BOLD}带宽限制${NC}（按「客户端实际速度」填写，单位 Mbps，填 0 = 不限速）"
+    echo -e "  ${YELLOW}⚠ 注意：服务端配置里的 up / down 和客户端是反的！${NC}"
+    echo "    服务端 up（发出）= 客户端下载；服务端 down（接收）= 客户端上传。"
+    echo "    这里直接填客户端的上传 / 下载速度，脚本会自动对调后写入服务端配置。"
+    echo ""
+    while true; do
+        read -rp "  客户端上传带宽 Mbps（默认 50，0 = 不限）: " v
+        v=${v:-50}
+        if [[ "$v" =~ ^[0-9]+$ ]]; then HY2_UL_MBPS=$(( 10#$v )); break; fi
+        warn "请输入非负整数（0 = 不限速）"
+    done
+    while true; do
+        read -rp "  客户端下载带宽 Mbps（默认 200，0 = 不限）: " v
+        v=${v:-200}
+        if [[ "$v" =~ ^[0-9]+$ ]]; then HY2_DL_MBPS=$(( 10#$v )); break; fi
+        warn "请输入非负整数（0 = 不限速）"
+    done
+    echo -e "  ${DIM}→ 服务端将写入: up ${HY2_DL_MBPS} mbps（= 客户端下载） / down ${HY2_UL_MBPS} mbps（= 客户端上传）${NC}"
+    echo -e "  ${DIM}  限速只对 Brutal 生效：客户端必须声明自己的带宽，否则走 BBR，服务端限速不起作用。${NC}"
+    echo -e "  ${DIM}  本脚本输出的 client.yaml 已带 bandwidth；用分享链接导入的客户端需自行在客户端里填写。${NC}"
+
+    echo ""
+    echo "  QUIC 路径 MTU 探测（Hysteria 2 不能指定具体 MTU 数值，只能开关探测）"
+    echo "    默认保持开启（自动探测）。仅当链路丢大包、连上后卡住或速度异常时才建议关闭。"
+    echo "    关闭后服务端与客户端需保持一致。"
+    read -rp "  是否关闭 MTU 探测？[y/N]: " v
+    if [[ "${v:-N}" =~ ^[Yy]$ ]]; then HY2_NO_PMTUD=1; else HY2_NO_PMTUD=0; fi
+    return 0
+}
+
+# 服务端 config.yaml 里的 bandwidth / quic 段（up = 客户端下载，down = 客户端上传）
+hy2_extra_config_block() {
+    local srv_up=$HY2_DL_MBPS srv_down=$HY2_UL_MBPS
+    if (( srv_up > 0 || srv_down > 0 )); then
+        echo "bandwidth:"
+        if (( srv_up   > 0 )); then echo "  up: ${srv_up} mbps    # 服务端发出 = 客户端下载"; fi
+        if (( srv_down > 0 )); then echo "  down: ${srv_down} mbps    # 服务端接收 = 客户端上传"; fi
+    fi
+    if (( HY2_NO_PMTUD == 1 )); then
+        if (( srv_up > 0 || srv_down > 0 )); then echo ""; fi
+        echo "quic:"
+        echo "  disablePathMTUDiscovery: true"
+    fi
+    return 0
+}
+
+# 客户端 client.yaml 里的 bandwidth / quic 段（客户端视角：up = 上传，down = 下载）
+hy2_client_extra_block() {
+    local up=$HY2_UL_MBPS down=$HY2_DL_MBPS
+    if (( up > 0 || down > 0 )); then
+        echo "bandwidth:"
+        if (( up   > 0 )); then echo "  up: ${up} mbps"; fi
+        if (( down > 0 )); then echo "  down: ${down} mbps"; fi
+    fi
+    if (( HY2_NO_PMTUD == 1 )); then
+        if (( up > 0 || down > 0 )); then echo ""; fi
+        echo "quic:"
+        echo "  disablePathMTUDiscovery: true"
+    fi
+    return 0
+}
+
+hy2_bw_summary() {
+    if (( HY2_UL_MBPS == 0 && HY2_DL_MBPS == 0 )); then
+        printf '不限速'
+        return 0
+    fi
+    local ul="${HY2_UL_MBPS} Mbps" dl="${HY2_DL_MBPS} Mbps"
+    if (( HY2_UL_MBPS == 0 )); then ul="不限"; fi
+    if (( HY2_DL_MBPS == 0 )); then dl="不限"; fi
+    printf '客户端 上传 %s / 下载 %s（服务端配置写作 up %s / down %s，方向相反）' "$ul" "$dl" "$dl" "$ul"
+    return 0
+}
+
+# ────────────────────────────────────────────────────────────
 #  写入 config.yaml —— ACME 模式
 # ────────────────────────────────────────────────────────────
 hy2_write_config_acme() {
@@ -959,6 +1082,8 @@ acme:
   ca: ${ca}
   dir: ${HY2_ACME_DIR}
   type: http
+
+$(hy2_extra_config_block)
 
 auth:
   type: password
@@ -984,6 +1109,8 @@ listen: :${port}
 tls:
   cert: ${HY2_CERT_DIR}/server.crt
   key:  ${HY2_CERT_DIR}/server.key
+
+$(hy2_extra_config_block)
 
 auth:
   type: password
@@ -1155,6 +1282,10 @@ hy2_print_client_info() {
         echo -e "  ${BOLD}TLS 模式        :${NC} ${CYAN}自签名证书${NC}"
     fi
     echo -e "  ${BOLD}密码            :${NC} ${CYAN}${password}${NC}"
+    echo -e "  ${BOLD}带宽限制        :${NC} ${CYAN}$(hy2_bw_summary)${NC}"
+    if (( HY2_NO_PMTUD == 1 )); then
+        echo -e "  ${BOLD}MTU 探测        :${NC} ${CYAN}已关闭（客户端也要设 quic.disablePathMTUDiscovery: true）${NC}"
+    fi
     hr
 
     # ── 证书目录 ────────────────────────────────────────────
@@ -1210,9 +1341,7 @@ tls:
   insecure: true
   pinSHA256: ${_FP_COLON}
 
-bandwidth:
-  up: 50 mbps
-  down: 200 mbps
+$(hy2_client_extra_block)
 
 socks5:
   listen: 127.0.0.1:1080
@@ -1232,9 +1361,7 @@ EOF
 ${CYAN}server: ${yaml_host}:${port}
 auth: ${password}
 
-bandwidth:
-  up: 50 mbps
-  down: 200 mbps
+$(hy2_client_extra_block)
 
 socks5:
   listen: 127.0.0.1:1080
@@ -1407,6 +1534,8 @@ install_hysteria2() {
     read -rp "  认证密码（默认随机: ${DEFAULT_PASS}）: " PASSWORD
     PASSWORD=${PASSWORD:-$DEFAULT_PASS}
 
+    hy2_ask_limits
+
     # ── 开始安装 ────────────────────────────────────────────
     hy2_install_deps
 
@@ -1485,11 +1614,14 @@ AT_SERVICE="/etc/systemd/system/${AT_SERVICE_NAME}.service"
 AT_CERT="${AT_DIR}/cert.pem"
 AT_KEY="${AT_DIR}/private.key"
 AT_ACME_DIR="${AT_DIR}/acme"
+AT_WANTS_LINK="/etc/systemd/system/multi-user.target.wants/${AT_SERVICE_NAME}.service"
+AT_DOMAIN_RE='^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
 
 # 全局：供分享链接 / 二维码 / 客户端配置使用
 AT_LINKS=()
 AT_CERT_FILE=""
 AT_SPKI_B64=""
+AT_FP_COLON=""
 
 # ────────────────────────────────────────────────────────────
 #  小工具：URL 编码 / JSON 转义 / 端口占用检测 / 监听地址
@@ -1512,6 +1644,45 @@ at_json_escape() {
     s="${s//\\/\\\\}"
     s="${s//\"/\\\"}"
     printf '%s' "$s"
+}
+
+# YAML 标量：安全的纯文本原样输出（和常见写法一致），可能被误解析的才加双引号
+at_yaml_str() {
+    local s="$1"
+    if [[ "$s" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+       && ! [[ "$s" =~ ^[-+]?[0-9][0-9._]*([eE][-+]?[0-9]+)?$ ]] \
+       && ! [[ "$s" =~ ^0[xXoObB] ]] \
+       && ! [[ "${s,,}" =~ ^(y|n|yes|no|true|false|on|off|null)$ ]]; then
+        printf '%s' "$s"
+    else
+        printf '"%s"' "$(at_json_escape "$s")"
+    fi
+}
+
+# server 字段：域名 / IPv4 原样输出，IPv6（含冒号）加引号
+at_yaml_host() {
+    if [[ "$1" == *:* ]]; then
+        printf '"%s"' "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# 合法域名（且最后一段必须含字母，从而排除 1.2.3.4 这类 IP）
+at_valid_domain() {
+    local d=$1
+    [[ "$d" =~ $AT_DOMAIN_RE ]] && [[ "${d##*.}" =~ [A-Za-z] ]]
+}
+
+# 读取已有 AnyTLS 配置里的监听端口（无 jq 时退回 sed）
+at_conf_port() {
+    [[ -f "$AT_CONF" ]] || return 0
+    if command -v jq &>/dev/null; then
+        jq -r '.inbounds[0].listen_port // empty' "$AT_CONF" 2>/dev/null || true
+    else
+        sed -nE 's/^[[:space:]]*"listen_port":[[:space:]]*([0-9]+).*$/\1/p' "$AT_CONF" | head -1 || true
+    fi
+    return 0
 }
 
 # 检测某个 TCP 端口是否处于 LISTEN 状态（纯 /proc 实现，不依赖额外工具）
@@ -1560,16 +1731,23 @@ at_is_installed() {
 }
 
 at_do_uninstall() {
+    # 参数 purge：彻底删除（含 ACME 证书缓存，不再询问）
+    # 默认用于「重装」：会询问是否保留 ACME 证书缓存
+    local mode="${1:-keep}" port="" keep_acme=0 ans t
     step "卸载现有 AnyTLS 并清理文件"
+
+    # 先读出监听端口，稍后撤销防火墙放行规则
+    port=$(at_conf_port)
 
     systemctl stop    "$AT_SERVICE_NAME" 2>/dev/null || true
     systemctl disable "$AT_SERVICE_NAME" 2>/dev/null || true
-    rm -f "$AT_SERVICE"
+    pkill -f "^${AT_BIN} run" 2>/dev/null || true
+    rm -f "$AT_SERVICE" "$AT_WANTS_LINK"
     systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed "$AT_SERVICE_NAME" 2>/dev/null || true
 
-    # ACME 证书缓存默认保留：同一域名短时间内反复签发会触发 CA 频率限制
-    local keep_acme=0 ans t
-    if [[ -d "$AT_ACME_DIR" ]]; then
+    # ACME 证书缓存在「重装」时默认保留：同一域名短时间内反复签发会触发 CA 频率限制
+    if [[ "$mode" != "purge" && -d "$AT_ACME_DIR" ]]; then
         warn "检测到 ACME 证书缓存: ${AT_ACME_DIR}"
         echo "  同一域名反复重新签发会触发 CA 的频率限制（Let's Encrypt：同一组域名每周 5 张），默认保留。"
         read -rp "  是否同时删除 ACME 证书缓存？[y/N]: " ans
@@ -1578,14 +1756,22 @@ at_do_uninstall() {
 
     if (( keep_acme == 1 )); then
         for t in "$AT_BIN" "$AT_CONF" "$AT_CERT" "$AT_KEY"; do
-            [[ -e "$t" ]] && { info "删除 $t"; rm -f "$t"; }
+            if [[ -e "$t" ]]; then
+                info "删除 $t"
+                rm -f "$t"
+            fi
         done
         info "已保留 ACME 证书缓存: ${AT_ACME_DIR}"
     elif [[ -e "$AT_DIR" ]]; then
         info "删除 $AT_DIR"
         rm -rf "$AT_DIR"
     fi
+
+    if [[ -n "$port" ]]; then
+        fw_close_tcp_port "$port"
+    fi
     info "✅ 卸载清理完毕"
+    return 0
 }
 
 # ────────────────────────────────────────────────────────────
@@ -1877,6 +2063,7 @@ at_wait_for_acme_cert() {
 at_print_cert_fingerprint() {
     local cert_file=$1
     AT_SPKI_B64=""
+    AT_FP_COLON=""
     if [[ ! -f "$cert_file" ]]; then
         warn "证书文件不存在，跳过指纹输出: $cert_file"
         return 0
@@ -1892,6 +2079,7 @@ at_print_cert_fingerprint() {
            | openssl dgst -sha256 -binary 2>/dev/null \
            | base64 -w0 2>/dev/null) || spki=""
     AT_SPKI_B64="$spki"
+    AT_FP_COLON="$fp_colon"
 
     echo ""
     printf "  ${BOLD}证书 SHA256 指纹${NC}  ${DIM}（十六进制·冒号分隔）${NC}\n"
@@ -1957,6 +2145,34 @@ at_print_qr() {
 }
 
 # ────────────────────────────────────────────────────────────
+#  输出 Clash / Mihomo 节点（可直接粘贴到 proxies: 下面）
+#  自签名：用 fingerprint 固定证书；ACME：受信证书，无需 fingerprint
+# ────────────────────────────────────────────────────────────
+at_print_mihomo_snippet() {
+    local tls_mode=$1 host=$2 password=$3 port=$4 sni=$5
+
+    echo -e "${BOLD}# Clash / Mihomo 节点（粘贴到 proxies: 下面）：${NC}"
+    printf '%b' "$CYAN"
+    echo "  - name: $(at_yaml_str "AnyTLS-${host}")"
+    echo "    type: anytls"
+    echo "    server: $(at_yaml_host "$host")"
+    echo "    port: ${port}"
+    echo "    password: $(at_yaml_str "$password")"
+    echo "    udp: true"
+    echo "    sni: ${sni}"
+    if [[ "$tls_mode" == "2" && -n "$AT_FP_COLON" ]]; then
+        echo "    fingerprint: ${AT_FP_COLON}"
+        echo "    skip-cert-verify: false"
+    elif [[ "$tls_mode" == "2" ]]; then
+        echo "    skip-cert-verify: true"
+    else
+        echo "    skip-cert-verify: false"
+    fi
+    printf '%b' "$NC"
+    return 0
+}
+
+# ────────────────────────────────────────────────────────────
 #  输出 sing-box / Clash(Mihomo) 客户端配置片段
 # ────────────────────────────────────────────────────────────
 at_print_client_snippets() {
@@ -2016,22 +2232,7 @@ EOF
     fi
 
     echo ""
-    echo -e "${BOLD}# Clash / Mihomo 节点：${NC}"
-    printf '%b' "$CYAN"
-    cat <<EOF
-proxies:
-  - name: AnyTLS
-    type: anytls
-    server: ${host}
-    port: ${port}
-    password: "${pw}"
-    udp: true
-    sni: "${sni}"
-EOF
-    if [[ "$tls_mode" == "2" ]]; then
-        echo "    skip-cert-verify: true"
-    fi
-    printf '%b' "$NC"
+    at_print_mihomo_snippet "$tls_mode" "$host" "$password" "$port" "$sni"
 }
 
 # ────────────────────────────────────────────────────────────
@@ -2191,6 +2392,17 @@ show_anytls_existing_config() {
         warn "未能从配置中提取端口/密码，无法生成分享链接"
     fi
 
+    local host=""
+    if [[ "$tls_mode" == "1" ]]; then
+        host="$domain"
+    else
+        host="${server_ipv4:-$server_ipv6}"
+    fi
+    if [[ -n "$host" && -n "$password" && -n "$port" ]]; then
+        echo ""
+        at_print_client_snippets "$tls_mode" "$host" "$password" "$port" "${sni:-$domain}"
+    fi
+
     echo ""
     echo -e "  ${BOLD}原始配置（前 60 行）:${NC}"
     sed -n '1,60p' "$config"
@@ -2231,7 +2443,6 @@ install_anytls() {
     echo ""
 
     local TLS_MODE DOMAIN="" EMAIL="" ACME_CA="letsencrypt" SNI="" PORT PASSWORD ans
-    local domain_re='^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
     local email_re='^[^@"[:space:]]+@[^@"[:space:]]+\.[^@"[:space:]]+$'
 
     echo "  TLS 证书模式："
@@ -2255,7 +2466,7 @@ install_anytls() {
         echo ""
         read -rp "  请输入域名（需已 DNS 解析到本机 IP）: " DOMAIN
         DOMAIN=$(echo "$DOMAIN" | sed -E 's|^https?://||;s|/.*||;s/[[:space:]]//g')
-        [[ "$DOMAIN" =~ $domain_re ]] || error "域名格式不正确：${DOMAIN:-（空）}"
+        at_valid_domain "$DOMAIN" || error "域名格式不正确：${DOMAIN:-（空）}"
         read -rp "  请输入邮箱（ACME 账号注册 + 到期通知）: " EMAIL
         EMAIL=$(echo "$EMAIL" | sed -E 's/[[:space:]]//g')
         [[ "$EMAIL" =~ $email_re ]] || error "邮箱格式不正确：${EMAIL:-（空）}"
@@ -2289,7 +2500,7 @@ install_anytls() {
         read -rp "  请输入 SNI 域名（默认: bing.com）: " SNI
         SNI=${SNI:-bing.com}
         SNI=$(echo "$SNI" | sed -E 's|^https?://||;s|/.*||;s/[[:space:]]//g')
-        [[ "$SNI" =~ $domain_re ]] || error "SNI 必须是合法域名（不能是 IP 地址）：${SNI:-（空）}"
+        at_valid_domain "$SNI" || error "SNI 必须是合法域名（不能是 IP 地址）：${SNI:-（空）}"
         info "SNI 设置为: ${SNI}"
     fi
 
@@ -2386,6 +2597,307 @@ install_anytls() {
         "$TLS_MODE" "$DOMAIN" "$PASSWORD" "$PORT" "${SNI:-$DOMAIN}" \
         "$SERVER_IPV4" "$SERVER_IPV6" "$VERSION" "$AT_CERT_FILE"
 }
+
+# ╔══════════════════════════════════════════════════════════╗
+# ║        PART 4 — 删除已搭建的节点（卸载并清理干净）        ║
+# ╚══════════════════════════════════════════════════════════╝
+
+RE_XRAY_BIN="/usr/local/bin/xray"
+RE_XRAY_CONF_DIR="/usr/local/etc/xray"
+RE_XRAY_CONF="${RE_XRAY_CONF_DIR}/config.json"
+RE_XRAY_SHARE_DIR="/usr/local/share/xray"
+RE_XRAY_LOG_DIR="/var/log/xray"
+RE_XRAY_SERVICE="/etc/systemd/system/xray.service"
+RE_XRAY_INFO="/root/xray_reality_client.txt"
+SYSTEMD_WANTS_DIR="/etc/systemd/system/multi-user.target.wants"
+
+# ────────────────────────────────────────────────────────────
+#  是否已搭建（只要程序 / 配置 / 服务文件任意一个还在就算）
+# ────────────────────────────────────────────────────────────
+re_is_installed() { [[ -e "$RE_XRAY_BIN" || -e "$RE_XRAY_CONF_DIR" || -e "$RE_XRAY_SERVICE" ]]; }
+hy2_has_files()   { [[ -e "$HY2_BIN" || -e "$HY2_CONF_DIR" || -e "$HY2_SERVICE" ]]; }
+at_has_files()    { [[ -e "$AT_BIN" || -e "$AT_DIR" || -e "$AT_SERVICE" ]]; }
+
+# ────────────────────────────────────────────────────────────
+#  读取各节点配置里的监听端口（无 jq 时退回 sed）
+# ────────────────────────────────────────────────────────────
+re_conf_port() {
+    [[ -f "$RE_XRAY_CONF" ]] || return 0
+    if command -v jq &>/dev/null; then
+        jq -r '.inbounds[0].port // empty' "$RE_XRAY_CONF" 2>/dev/null || true
+    else
+        sed -nE 's/^[[:space:]]*"port":[[:space:]]*([0-9]+).*$/\1/p' "$RE_XRAY_CONF" | head -1 || true
+    fi
+    return 0
+}
+
+hy2_conf_port() {
+    [[ -f "$HY2_CONF" ]] || return 0
+    sed -nE 's/^listen:[[:space:]]*:([0-9]+).*$/\1/p' "$HY2_CONF" | head -1 || true
+    return 0
+}
+
+# ────────────────────────────────────────────────────────────
+#  撤销防火墙里放行的 TCP 端口（ufw / firewalld / iptables / ip6tables）
+#  只处理确实存在的规则；端口仍被其它程序监听时保留规则
+# ────────────────────────────────────────────────────────────
+fw_close_tcp_port() {
+    local p=$1 n ipt st
+    [[ "$p" =~ ^[0-9]+$ ]] || return 0
+
+    if at_port_in_use "$p"; then
+        warn "TCP ${p} 端口仍被其它程序占用，保留防火墙放行规则"
+        return 0
+    fi
+
+    if command -v ufw &>/dev/null; then
+        st=$(ufw status 2>/dev/null || true)
+        if grep -qE "^${p}/tcp[[:space:]]+ALLOW" <<< "$st"; then
+            if ufw --force delete allow "${p}/tcp" >/dev/null 2>&1; then
+                info "ufw 已移除 ${p}/tcp 放行规则"
+            else
+                warn "ufw 移除失败，请手动执行: ufw delete allow ${p}/tcp"
+            fi
+        fi
+    fi
+
+    if command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null; then
+        if firewall-cmd --permanent --query-port="${p}/tcp" &>/dev/null; then
+            firewall-cmd --permanent --remove-port="${p}/tcp" >/dev/null 2>&1 || true
+            firewall-cmd --reload >/dev/null 2>&1 || true
+            info "firewalld 已移除 ${p}/tcp 放行规则"
+        fi
+    fi
+
+    for ipt in iptables ip6tables; do
+        command -v "$ipt" &>/dev/null || continue
+        n=0
+        while "$ipt" -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null; do
+            n=$(( n + 1 ))
+            if (( n >= 20 )); then break; fi
+        done
+        if (( n > 0 )); then
+            info "${ipt} 已移除 ${n} 条 ${p}/tcp 放行规则"
+        fi
+    done
+    return 0
+}
+
+# ────────────────────────────────────────────────────────────
+#  删除后的残留检查：逐个确认路径已不存在
+# ────────────────────────────────────────────────────────────
+purge_verify() {
+    local label=$1 p
+    shift
+    local -a left=()
+    for p in "$@"; do
+        if [[ -e "$p" || -L "$p" ]]; then
+            left+=("$p")
+        fi
+    done
+    if (( ${#left[@]} == 0 )); then
+        info "✅ ${label}：残留检查通过，已删除干净"
+    else
+        warn "${label}：以下路径仍然存在，请手动检查："
+        for p in "${left[@]}"; do
+            echo "      $p"
+        done
+    fi
+    return 0
+}
+
+# ────────────────────────────────────────────────────────────
+#  三个协议各自的「彻底删除」
+# ────────────────────────────────────────────────────────────
+re_purge() {
+    local port t
+    step "删除 VLESS + REALITY（Xray）并清理所有文件"
+    port=$(re_conf_port)
+
+    systemctl stop    xray 2>/dev/null || true
+    systemctl disable xray 2>/dev/null || true
+    pkill -f "^${RE_XRAY_BIN} run" 2>/dev/null || true
+
+    for t in "$RE_XRAY_SERVICE" "${SYSTEMD_WANTS_DIR}/xray.service" "$RE_XRAY_BIN" \
+             "$RE_XRAY_CONF_DIR" "$RE_XRAY_SHARE_DIR" "$RE_XRAY_LOG_DIR" "$RE_XRAY_INFO"; do
+        if [[ -e "$t" || -L "$t" ]]; then
+            info "删除 $t"
+            rm -rf "$t"
+        fi
+    done
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed xray 2>/dev/null || true
+
+    if [[ -n "$port" ]]; then
+        fw_close_tcp_port "$port"
+    fi
+    purge_verify "VLESS + REALITY" "$RE_XRAY_SERVICE" "${SYSTEMD_WANTS_DIR}/xray.service" \
+        "$RE_XRAY_BIN" "$RE_XRAY_CONF_DIR" "$RE_XRAY_SHARE_DIR" "$RE_XRAY_LOG_DIR" "$RE_XRAY_INFO"
+    return 0
+}
+
+hy2_purge() {
+    pkill -f "^${HY2_BIN} server" 2>/dev/null || true
+    hy2_do_uninstall
+    rm -f "${SYSTEMD_WANTS_DIR}/hysteria-server.service"
+    systemctl reset-failed hysteria-server 2>/dev/null || true
+    purge_verify "Hysteria 2" "$HY2_BIN" "$HY2_SERVICE" "${SYSTEMD_WANTS_DIR}/hysteria-server.service" \
+        "$HY2_CONF_DIR" "/var/log/hysteria"
+    return 0
+}
+
+at_purge() {
+    at_do_uninstall purge
+    purge_verify "AnyTLS" "$AT_DIR" "$AT_SERVICE" "$AT_WANTS_LINK"
+    return 0
+}
+
+# ────────────────────────────────────────────────────────────
+#  列表里的一行：编号 / 名称 / 端口 / 运行状态
+# ────────────────────────────────────────────────────────────
+node_row() {
+    local idx=$1 label=$2 present=$3 svc=$4 port=$5 st
+    if (( present == 1 )); then
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            st="${GREEN}● 运行中${NC}"
+        else
+            st="${RED}○ 未运行${NC}"
+        fi
+        printf "    [%s]  %-28s 端口 %-7s %b\n" "$idx" "$label" "${port:-未知}" "$st"
+    else
+        printf "    [%s]  %-28s ${DIM}未检测到${NC}\n" "$idx" "$label"
+    fi
+    return 0
+}
+
+# ────────────────────────────────────────────────────────────
+#  主菜单「删除已搭建的节点」入口
+# ────────────────────────────────────────────────────────────
+delete_nodes() {
+    clear
+    box "删除已搭建的节点"
+    echo ""
+
+    local has_re=0 has_hy2=0 has_at=0
+    if re_is_installed; then has_re=1; fi
+    if hy2_has_files;   then has_hy2=1; fi
+    if at_has_files;    then has_at=1; fi
+
+    local re_port hy2_port at_port
+    re_port=$(re_conf_port)
+    hy2_port=$(hy2_conf_port)
+    at_port=$(at_conf_port)
+
+    echo "  当前检测到的节点："
+    echo ""
+    node_row 1 "VLESS + REALITY（Xray）" "$has_re"  xray              "$re_port"
+    node_row 2 "Hysteria 2"              "$has_hy2" hysteria-server   "$hy2_port"
+    node_row 3 "AnyTLS（sing-box）"      "$has_at"  "$AT_SERVICE_NAME" "$at_port"
+    echo ""
+
+    if (( has_re + has_hy2 + has_at == 0 )); then
+        warn "未检测到本脚本搭建的任何节点，无需删除"
+        echo ""
+        read -rp "按回车返回主菜单..." _
+        return 0
+    fi
+
+    local sel tok n todo=" "
+    read -rp "  请输入要删除的编号（可多选，如 1 3；a = 全部；0 = 返回）: " sel
+    sel=${sel//,/ }
+    sel=${sel,,}
+
+    if [[ -z "${sel// /}" || "${sel// /}" == "0" ]]; then
+        return 0
+    fi
+
+    if [[ "${sel// /}" == "a" || "${sel// /}" == "all" ]]; then
+        if (( has_re  == 1 )); then todo+="1 "; fi
+        if (( has_hy2 == 1 )); then todo+="2 "; fi
+        if (( has_at  == 1 )); then todo+="3 "; fi
+    else
+        for tok in $sel; do
+            case "$tok" in
+                1) if (( has_re  == 1 )); then [[ "$todo" == *" 1 "* ]] || todo+="1 "; else warn "未检测到 REALITY 节点，已忽略"; fi ;;
+                2) if (( has_hy2 == 1 )); then [[ "$todo" == *" 2 "* ]] || todo+="2 "; else warn "未检测到 Hysteria 2 节点，已忽略"; fi ;;
+                3) if (( has_at  == 1 )); then [[ "$todo" == *" 3 "* ]] || todo+="3 "; else warn "未检测到 AnyTLS 节点，已忽略"; fi ;;
+                *) warn "无效选项「${tok}」，已忽略" ;;
+            esac
+        done
+    fi
+
+    if [[ -z "${todo// /}" ]]; then
+        warn "没有选中任何可删除的节点"
+        echo ""
+        read -rp "按回车返回主菜单..." _
+        return 0
+    fi
+
+    # ── 列出将被删除的内容，二次确认 ─────────────────────────
+    echo ""
+    hr
+    echo -e "  ${BOLD}${RED}以下内容将被永久删除：${NC}"
+    for n in $todo; do
+        case "$n" in
+            1)
+                echo -e "  ${BOLD}▸ VLESS + REALITY（Xray）${NC}"
+                echo "      服务   : xray（停止并禁用）  ${RE_XRAY_SERVICE}"
+                echo "      程序   : ${RE_XRAY_BIN}"
+                echo "      配置   : ${RE_XRAY_CONF_DIR}（含 UUID / 私钥）"
+                echo "      数据   : ${RE_XRAY_SHARE_DIR}    日志: ${RE_XRAY_LOG_DIR}"
+                echo "      客户端 : ${RE_XRAY_INFO}"
+                if [[ -n "$re_port" ]]; then
+                    echo "      防火墙 : 移除 TCP ${re_port} 放行规则（端口无其它程序占用时）"
+                fi
+                ;;
+            2)
+                echo -e "  ${BOLD}▸ Hysteria 2${NC}"
+                echo "      服务   : hysteria-server（停止并禁用）  ${HY2_SERVICE}"
+                echo "      程序   : ${HY2_BIN}"
+                echo "      配置   : ${HY2_CONF_DIR}（含密码 / 自签或 ACME 证书）"
+                echo "      日志   : /var/log/hysteria"
+                ;;
+            3)
+                echo -e "  ${BOLD}▸ AnyTLS（sing-box）${NC}"
+                echo "      服务   : ${AT_SERVICE_NAME}（停止并禁用）  ${AT_SERVICE}"
+                echo "      目录   : ${AT_DIR}（sing-box 程序 / 配置 / 证书）"
+                if [[ -d "$AT_ACME_DIR" ]]; then
+                    echo "      ACME   : ${AT_ACME_DIR}（证书缓存一并删除，同域名重新搭建需重新签发）"
+                fi
+                if [[ -n "$at_port" ]]; then
+                    echo "      防火墙 : 移除 TCP ${at_port} 放行规则（端口无其它程序占用时）"
+                fi
+                ;;
+        esac
+    done
+    echo ""
+    echo -e "  ${DIM}不会动：apt 装的 curl/jq 等通用依赖、proxy 快捷命令、80 端口的放行规则${NC}"
+    hr
+    local ans
+    read -rp "  确认删除以上内容？此操作不可恢复 [y/N]: " ans
+    if ! [[ "${ans:-N}" =~ ^[Yy]$ ]]; then
+        info "已取消，未做任何改动。"
+        echo ""
+        read -rp "按回车返回主菜单..." _
+        return 0
+    fi
+
+    # ── 执行删除 ─────────────────────────────────────────────
+    for n in $todo; do
+        case "$n" in
+            1) re_purge  ;;
+            2) hy2_purge ;;
+            3) at_purge  ;;
+        esac
+    done
+
+    echo ""
+    info "✅ 所选节点已全部删除。客户端里对应的节点配置已失效，请自行移除。"
+    echo ""
+    read -rp "按回车返回主菜单..." _
+    return 0
+}
+
 
 # ════════════════════════════════════════════════════════════
 #  入口
