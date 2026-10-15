@@ -172,13 +172,17 @@ fw_release() {
 # ------------------------- 安装 Xray / Caddy -------------------------
 ensure_xray() {
   [[ -x "$XRAY_BIN" ]] && return 0
-  info "安装 Xray-core..."
+  local log=/tmp/xnode-xray-install.log
+  info "安装 Xray-core（安装日志：$log）..."
   curl -fsSL -o /tmp/xray-install.sh \
     https://github.com/XTLS/Xray-install/raw/main/install-release.sh \
     || { warn "下载 Xray 安装脚本失败，请检查 VPS 到 GitHub 的连通性"; return 1; }
-  bash /tmp/xray-install.sh install >/dev/null 2>&1
+  bash /tmp/xray-install.sh install 2>&1 | tee "$log"
   rm -f /tmp/xray-install.sh
-  [[ -x "$XRAY_BIN" ]] || { warn "Xray 安装失败"; return 1; }
+  if [[ ! -x "$XRAY_BIN" ]]; then
+    warn "Xray 安装失败，上面是安装程序的原始输出（完整日志：$log）"
+    return 1
+  fi
 }
 
 ensure_caddy() {
