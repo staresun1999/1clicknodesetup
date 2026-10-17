@@ -3,9 +3,11 @@
 #  代理协议一键安装脚本
 #  支持：
 #    [1] VLESS + TCP + XTLS-Vision + REALITY（Xray-core）
-#    [2] Hysteria 2（ACME 自动证书 / 自签名证书）
-#    [3] AnyTLS（sing-box 内核；ACME 自动证书 / 自签名证书）
+#    [2] Hysteria 2（ACME 自动证书 / 自签名证书，可指定证书目录）
+#    [3] AnyTLS（sing-box 内核；ACME 自动证书 / 自签名证书，可指定证书目录）
 #    另含：[4] 查看已有节点配置   [5] 删除已搭建的节点（卸载并清理干净）
+#  所有节点搭建完成后，都会输出 Clash / Mihomo 订阅格式配置（单节点），
+#  并保存到 /root/clash_*.yaml
 #  支持系统：Ubuntu 20.04/22.04/24.04 | Debian 10/11/12
 #            CentOS / Rocky / AlmaLinux（仅 Hysteria 2 / AnyTLS）
 # ============================================================
@@ -62,6 +64,217 @@ box() {
 }
 
 # ════════════════════════════════════════════════════════════
+#  通用：证书目录（Hysteria 2 / AnyTLS 共用）
+#  - 路径必须是绝对路径，且只允许 字母 数字 . _ - / @ +
+#  - 拒绝直接使用 /etc /usr /root 等系统目录
+#  - 卸载时只删除脚本生成的证书文件，绝不 rm -rf 用户指定的目录
+# ════════════════════════════════════════════════════════════
+CERT_DIR_RESULT=""
+
+cert_dir_normalize() {
+    local d=$1 re='^/[A-Za-z0-9._/@+-]+$'
+    if [[ "$d" != /* ]]; then
+        warn "请填写绝对路径（以 / 开头）"
+        return 1
+    fi
+    if ! [[ "$d" =~ $re ]]; then
+        warn "路径只能包含字母、数字和 . _ - / @ +（不能有空格、引号等特殊字符）"
+        return 1
+    fi
+    d=$(readlink -m -- "$d" 2>/dev/null || echo "$d")
+    case "$d" in
+        /|/bin|/boot|/dev|/etc|/lib|/lib64|/proc|/run|/sbin|/sys|/usr|/var|/root|/home|/tmp|/mnt|/opt|/srv)
+            warn "不能直接使用系统目录 ${d}，请指定一个专用子目录（例如 ${d%/}/proxy-certs）"
+            return 1 ;;
+    esac
+    if [[ -e "$d" && ! -d "$d" ]]; then
+        warn "${d} 已存在且不是目录"
+        return 1
+    fi
+    CERT_DIR_RESULT="$d"
+    return 0
+}
+
+# 交互询问证书目录；结果写入全局 CERT_DIR_RESULT
+ask_cert_dir() {
+    local label=$1 def=$2 v
+    while true; do
+        read -rp "  ${label}（默认 ${def}）: " v
+        v=${v:-$def}
+        if cert_dir_normalize "$v"; then
+            break
+        fi
+    done
+    info "${label}: ${CERT_DIR_RESULT}"
+    return 0
+}
+
+# 创建证书目录（已存在则原样使用，不改权限）
+cert_dir_prepare() {
+    local d=$1
+    if [[ ! -d "$d" ]]; then
+        mkdir -p "$d" || error "无法创建证书目录: ${d}"
+        chmod 700 "$d"
+    fi
+    [[ -w "$d" ]] || error "证书目录不可写: ${d}"
+    return 0
+}
+
+# 清理证书目录：只删除指定的文件/子目录名；目录变空后才 rmdir
+#   用法: cert_dir_cleanup <目录> <名称1> [名称2 ...]
+cert_dir_cleanup() {
+    local d=$1 f
+    shift
+    [[ -d "$d" ]] || return 0
+    for f in "$@"; do
+        if [[ -e "$d/$f" || -L "$d/$f" ]]; then
+            info "删除 ${d}/${f}"
+            rm -rf -- "${d:?}/${f:?}"
+        fi
+    done
+    if rmdir "$d" 2>/dev/null; then
+        info "已删除空目录 ${d}"
+    fi
+    return 0
+}
+
+# ════════════════════════════════════════════════════════════
+#  通用：Clash / Mihomo 订阅格式配置（单节点）
+#  依赖 Part 3 里的 at_yaml_str / at_yaml_host（运行时才调用，顺序无关）
+# ════════════════════════════════════════════════════════════
+RE_CLASH_FILE="/root/clash_reality.yaml"
+HY2_CLASH_FILE="/root/clash_hysteria2.yaml"
+AT_CLASH_FILE="/root/clash_anytls.yaml"
+
+# VLESS + REALITY 节点（Mihomo 格式）
+#   参数: 名称 服务器 端口 UUID SNI 公钥 ShortId
+clash_node_reality() {
+    local name=$1 host=$2 port=$3 uuid=$4 sni=$5 pbk=$6 sid=$7
+    echo "  - name: $(at_yaml_str "$name")"
+    echo "    type: vless"
+    echo "    server: $(at_yaml_host "$host")"
+    echo "    port: ${port}"
+    echo "    uuid: ${uuid}"
+    echo "    network: tcp"
+    echo "    udp: true"
+    echo "    tls: true"
+    echo "    flow: xtls-rprx-vision"
+    echo "    servername: ${sni}"
+    echo "    client-fingerprint: chrome"
+    echo "    reality-opts:"
+    echo "      public-key: \"${pbk}\""
+    echo "      short-id: \"${sid}\""
+    return 0
+}
+
+# Hysteria 2 节点（Mihomo 格式）
+#   参数: 名称 服务器 端口 密码 SNI 证书指纹(可空) 客户端上传Mbps 客户端下载Mbps 是否跳过校验(0/1)
+#   有指纹 → 固定证书指纹；无指纹且 insecure=1 → 跳过校验；否则走系统信任链（ACME）
+clash_node_hy2() {
+    local name=$1 host=$2 port=$3 password=$4 sni=$5 fp=${6:-} ul=${7:-0} dl=${8:-0} insecure=${9:-0}
+    echo "  - name: $(at_yaml_str "$name")"
+    echo "    type: hysteria2"
+    echo "    server: $(at_yaml_host "$host")"
+    echo "    port: ${port}"
+    echo "    password: $(at_yaml_str "$password")"
+    echo "    sni: ${sni}"
+    if [[ -n "$fp" ]]; then
+        echo "    skip-cert-verify: false"
+        echo "    fingerprint: ${fp}"
+    elif [[ "$insecure" == "1" ]]; then
+        echo "    skip-cert-verify: true"
+    else
+        echo "    skip-cert-verify: false"
+    fi
+    if (( ul > 0 )); then
+        echo "    up: \"${ul} Mbps\""
+    fi
+    if (( dl > 0 )); then
+        echo "    down: \"${dl} Mbps\""
+    fi
+    return 0
+}
+
+# AnyTLS 节点（Mihomo 格式）
+#   参数: 名称 服务器 端口 密码 SNI TLS模式(1=ACME 2=自签名) 证书指纹(可空)
+clash_node_anytls() {
+    local name=$1 host=$2 port=$3 password=$4 sni=$5 tls_mode=$6 fp=${7:-}
+    echo "  - name: $(at_yaml_str "$name")"
+    echo "    type: anytls"
+    echo "    server: $(at_yaml_host "$host")"
+    echo "    port: ${port}"
+    echo "    password: $(at_yaml_str "$password")"
+    echo "    udp: true"
+    echo "    sni: ${sni}"
+    if [[ "$tls_mode" == "2" && -n "$fp" ]]; then
+        echo "    fingerprint: ${fp}"
+        echo "    skip-cert-verify: false"
+    elif [[ "$tls_mode" == "2" ]]; then
+        echo "    skip-cert-verify: true"
+    else
+        echo "    skip-cert-verify: false"
+    fi
+    return 0
+}
+
+# 把单个节点包装成完整的 Clash / Mihomo 配置（订阅文件内容）
+#   参数: 节点名称 节点YAML（缩进已处理好的 "  - name: ..." 块）
+clash_full_config() {
+    local name=$1 node=$2 n
+    n=$(at_yaml_str "$name")
+    cat <<EOF
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: true
+
+dns:
+  enable: true
+  ipv6: true
+  enhanced-mode: fake-ip
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+
+proxies:
+${node}
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - ${n}
+      - DIRECT
+
+rules:
+  - GEOIP,LAN,DIRECT,no-resolve
+  - GEOIP,CN,DIRECT
+  - MATCH,PROXY
+EOF
+}
+
+# 输出到终端并保存为文件
+#   参数: 节点名称 保存路径 节点YAML
+clash_emit() {
+    local name=$1 file=$2 node=$3 cfg
+    cfg=$(clash_full_config "$name" "$node")
+    printf '%s\n' "$cfg" > "$file"
+    chmod 600 "$file"
+    echo ""
+    echo -e "${BOLD}# Clash / Mihomo 订阅格式配置（单节点）：${NC}"
+    echo -e "  ${DIM}整段保存为 .yaml 即可作为配置/订阅文件导入；已有配置只需复制 proxies: 下的节点${NC}"
+    echo ""
+    printf '%b%s%b\n' "$CYAN" "$cfg" "$NC"
+    echo ""
+    info "Clash 配置已保存至 ${file}"
+    return 0
+}
+
+# ════════════════════════════════════════════════════════════
 #  必须 root
 # ════════════════════════════════════════════════════════════
 [[ $EUID -ne 0 ]] && error "请使用 root 用户运行此脚本，或使用 sudo bash $0"
@@ -81,13 +294,13 @@ show_main_menu() {
     echo "  请选择要安装的协议："
     echo ""
     echo "    [1]  VLESS + TCP + XTLS-Vision + REALITY"
-    echo "         (Xray-core，抗检测，推荐)"
+    echo "         (Xray-core，抗检测，推荐；REALITY 借用目标站证书，无需本地证书)"
     echo ""
     echo "    [2]  Hysteria 2"
-    echo "         (基于 QUIC，高速，支持 ACME 证书 / 自签名)"
+    echo "         (基于 QUIC，高速，支持 ACME 证书 / 自签名，可指定证书目录)"
     echo ""
     echo "    [3]  AnyTLS"
-    echo "         (sing-box 内核，TLS + 流量填充，支持 ACME 证书 / 自签名)"
+    echo "         (sing-box 内核，TLS + 流量填充，支持 ACME 证书 / 自签名，可指定证书目录)"
     echo ""
     echo "    [4]  查看当前已有节点配置"
     echo ""
@@ -195,6 +408,11 @@ show_xray_existing_config() {
         else
             warn "未安装 qrencode，无法显示二维码（可运行: apt-get install -y qrencode）"
         fi
+
+        # ── Clash / Mihomo 订阅格式（单节点）──────────────────
+        local clash_host="${server_ipv4:-$server_ipv6}"
+        clash_emit "REALITY-${clash_host}" "$RE_CLASH_FILE" \
+            "$(clash_node_reality "REALITY-${clash_host}" "$clash_host" "$port" "$uuid" "$sni" "$public_key" "$short_id")"
     else
         warn "未能生成完整分享链接，请查看 ${info_file} 或手动填写服务器公网 IP"
     fi
@@ -204,12 +422,15 @@ show_hy2_existing_config() {
     local config="${HY2_CONF:-/etc/hysteria/config.yaml}"
     [[ -f "$config" ]] || return 1
 
+    # 证书目录可能是安装时自定义的，先从配置里读回来
+    hy2_load_paths_from_conf
+
     box "当前 Hysteria 2 节点"
     echo -e "  ${BOLD}配置文件${NC}: ${CYAN}${config}${NC}"
 
     local port="" password="" domain="" email="" ca=""
     local tls_mode="" server_ipv4="" server_ipv6=""
-    local cert_file="" sni="" status
+    local cert_file="" sni="" status cert_dir=""
     port=$(sed -nE 's/^listen:[[:space:]]*:([0-9]+).*$/\1/p' "$config" | head -1)
     password=$(sed -nE 's/^[[:space:]]*password:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/p' "$config" | head -1)
     email=$(sed -nE 's/^[[:space:]]*email:[[:space:]]*//p' "$config" | head -1)
@@ -224,10 +445,12 @@ show_hy2_existing_config() {
                 sub(/^[[:space:]]*-[[:space:]]*/, ""); print; exit
             }
         ' "$config")
-        cert_file=$(find "${HY2_ACME_DIR:-/etc/hysteria/acme}" -type f -name '*.crt' ! -name '*issuer*' -print -quit 2>/dev/null || true)
+        cert_dir="${HY2_ACME_DIR:-/etc/hysteria/acme}"
+        cert_file=$(find "$cert_dir" -type f -name '*.crt' ! -name '*issuer*' -print -quit 2>/dev/null || true)
     else
         tls_mode="自签名"
-        cert_file="${HY2_CERT_DIR:-/etc/hysteria/certs}/server.crt"
+        cert_dir="${HY2_CERT_DIR:-/etc/hysteria/certs}"
+        cert_file="${cert_dir}/server.crt"
     fi
 
     if [[ -n "$cert_file" && -f "$cert_file" ]]; then
@@ -248,6 +471,7 @@ show_hy2_existing_config() {
     [[ -n "$sni" ]] && printf "  ${BOLD}SNI${NC}:         %s\n" "$sni"
     [[ -n "$email" ]] && printf "  ${BOLD}ACME 邮箱${NC}:  %s\n" "$email"
     [[ -n "$ca" ]] && printf "  ${BOLD}ACME CA${NC}:    %s\n" "$ca"
+    printf "  ${BOLD}证书目录${NC}:   %s\n" "$cert_dir"
     [[ -n "$cert_file" ]] && printf "  ${BOLD}证书${NC}:       %s\n" "$cert_file"
 
     local bw_up bw_down
@@ -261,10 +485,21 @@ show_hy2_existing_config() {
         printf "  ${BOLD}MTU 探测${NC}:   已关闭\n"
     fi
 
+    # 服务端 up/down 与客户端相反：转换成「客户端上传 / 下载」供 Clash 配置使用
+    HY2_UL_MBPS=0
+    HY2_DL_MBPS=0
+    if [[ "$bw_up" =~ ^([0-9]+)[[:space:]]+[Mm]bps ]]; then
+        HY2_DL_MBPS=$(( 10#${BASH_REMATCH[1]} ))
+    fi
+    if [[ "$bw_down" =~ ^([0-9]+)[[:space:]]+[Mm]bps ]]; then
+        HY2_UL_MBPS=$(( 10#${BASH_REMATCH[1]} ))
+    fi
+
     server_ipv4=$(hy2_get_ipv4 2>/dev/null || true)
     server_ipv6=$(hy2_get_ipv6 2>/dev/null || true)
     echo ""
     _FP_B64=""
+    _FP_COLON=""
     if [[ "$tls_mode" == "自签名" && -f "$cert_file" ]]; then
         hy2_print_cert_fingerprints "$cert_file"
     fi
@@ -303,6 +538,26 @@ show_hy2_existing_config() {
         else
             warn "未安装 qrencode，无法显示二维码（可运行: apt-get install -y qrencode）"
         fi
+    fi
+
+    # ── Clash / Mihomo 订阅格式（单节点）──────────────────────
+    local c_host="" c_sni="" c_fp="" c_insecure=0
+    if [[ "$tls_mode" == "ACME" ]]; then
+        c_host="$domain"
+        c_sni="$domain"
+    else
+        c_host="${server_ipv4:-$server_ipv6}"
+        c_sni="$sni"
+        c_fp="${_FP_COLON:-}"
+        if [[ -z "$c_fp" ]]; then
+            c_insecure=1
+        fi
+    fi
+    if [[ -n "$c_host" && -n "$c_sni" && -n "$password" && -n "$port" ]]; then
+        clash_emit "Hysteria2-${c_host}" "$HY2_CLASH_FILE" \
+            "$(clash_node_hy2 "Hysteria2-${c_host}" "$c_host" "$port" "$password" "$c_sni" "$c_fp" "$HY2_UL_MBPS" "$HY2_DL_MBPS" "$c_insecure")"
+    else
+        warn "未能从配置中提取完整信息，无法生成 Clash 配置"
     fi
 
     echo ""
@@ -360,12 +615,31 @@ re_detect_os() {
 
 # ────────────────────────────────────────────────────────────
 #  安装依赖（REALITY）
+#  注意：第三方 apt 源（如已失效的 Caddy 源）导致 apt-get update
+#  返回非零时，不应中断安装，继续使用现有缓存即可。
 # ────────────────────────────────────────────────────────────
 re_install_deps() {
     step "安装依赖"
-    apt-get update -qq
+
+    local i update_ok=0
+    for i in 1 2; do
+        if apt-get update -qq; then
+            update_ok=1
+            break
+        fi
+        warn "apt-get update 返回错误（可能是某个第三方源失效，如 Caddy / Cloudsmith），重试 (${i}/2)..."
+        sleep 2
+    done
+    (( update_ok == 0 )) && warn "apt-get update 存在失败的源，已忽略，继续使用现有软件包缓存安装依赖"
+
     apt-get install -y -qq curl wget unzip jq qrencode 2>/dev/null || \
-        apt-get install -y -qq curl wget unzip jq
+        apt-get install -y -qq curl wget unzip jq \
+        || error "依赖安装失败。若是 apt 源问题，可临时禁用出错的源后重试，例如: mv /etc/apt/sources.list.d/caddy-stable.list /root/ && apt-get update"
+
+    local c
+    for c in curl unzip jq; do
+        command -v "$c" &>/dev/null || error "缺少依赖命令: ${c}"
+    done
     info "依赖安装完成"
 }
 
@@ -460,6 +734,10 @@ re_gen_keys() {
 # ────────────────────────────────────────────────────────────
 re_interactive_config() {
     step "交互式配置"
+
+    echo -e "${YELLOW}提示：REALITY 不使用本地证书（握手时借用 target 站点的真实证书），因此这里没有「证书目录」可指定；${NC}"
+    echo -e "${YELLOW}      如需指定证书目录，请使用 Hysteria 2 / AnyTLS。${NC}"
+    echo ""
 
     read -rp "$(echo -e "${CYAN}请输入监听端口 [默认 443]：${NC}")" INPUT_PORT
     RE_PORT="${INPUT_PORT:-443}"
@@ -650,6 +928,11 @@ re_print_client_info() {
         fi
     fi
 
+    # ── Clash / Mihomo 订阅格式（单节点，优先 IPv4）────────────
+    local clash_host="${server_ipv4:-$server_ipv6}"
+    clash_emit "REALITY-${clash_host}" "$RE_CLASH_FILE" \
+        "$(clash_node_reality "REALITY-${clash_host}" "$clash_host" "$RE_PORT" "$RE_UUID" "$RE_SERVER_NAME" "$RE_PUBLIC_KEY" "$RE_SHORT_ID")"
+
     local info_file="/root/xray_reality_client.txt"
     cat > "${info_file}" <<EOF
 VLESS + REALITY 客户端配置
@@ -669,6 +952,9 @@ ShortId    : ${RE_SHORT_ID}
 分享链接：
 $( [[ -n "$link_v4" ]] && echo "[IPv4] ${link_v4}" )
 $( [[ -n "$link_v6" ]] && echo "[IPv6] ${link_v6}" )
+
+Clash / Mihomo 订阅配置（单节点）：
+  ${RE_CLASH_FILE}
 
 服务管理命令：
   查看状态  : systemctl status xray
@@ -731,12 +1017,20 @@ HY2_BIN="/usr/local/bin/hysteria"
 HY2_CONF_DIR="/etc/hysteria"
 HY2_CONF="${HY2_CONF_DIR}/config.yaml"
 HY2_SERVICE="/etc/systemd/system/hysteria-server.service"
-HY2_CERT_DIR="${HY2_CONF_DIR}/certs"
-HY2_ACME_DIR="${HY2_CONF_DIR}/acme"
+
+# 证书目录：默认值固定不变；实际使用的 HY2_CERT_DIR / HY2_ACME_DIR
+# 会在安装时由用户指定，或在查看 / 卸载时从 config.yaml 读回
+HY2_CERT_DIR_DEFAULT="${HY2_CONF_DIR}/certs"
+HY2_ACME_DIR_DEFAULT="${HY2_CONF_DIR}/acme"
+HY2_CERT_DIR="$HY2_CERT_DIR_DEFAULT"     # 自签名证书目录（server.crt / server.key）
+HY2_ACME_DIR="$HY2_ACME_DIR_DEFAULT"     # ACME 数据目录（证书 / 账号 / 锁）
 
 # 全局：证书指纹（供 URI 使用）
 _FP_B64=""
 _FP_COLON=""
+
+# 全局：ACME 等待结果（避免命令替换吞掉输出）
+HY2_CERT_FOUND=""
 
 # 全局：带宽限制（按「客户端实际速度」记录，单位 Mbps，0 = 不限速）与 MTU 探测开关
 HY2_UL_MBPS=50     # 客户端上传
@@ -751,24 +1045,59 @@ hy2_is_installed() {
 }
 
 # ────────────────────────────────────────────────────────────
+#  从已有 config.yaml 读回证书目录（安装时可能指定了自定义目录）
+#    ACME 模式  → acme.dir          → HY2_ACME_DIR
+#    自签名模式 → tls.cert 所在目录 → HY2_CERT_DIR
+# ────────────────────────────────────────────────────────────
+hy2_load_paths_from_conf() {
+    [[ -f "$HY2_CONF" ]] || return 0
+    local v=""
+    if grep -q '^acme:' "$HY2_CONF"; then
+        v=$(sed -nE 's/^[[:space:]]*dir:[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1/p' "$HY2_CONF" | head -1 || true)
+        if [[ -n "$v" ]]; then
+            HY2_ACME_DIR="$v"
+        fi
+    else
+        v=$(sed -nE 's/^[[:space:]]*cert:[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1/p' "$HY2_CONF" | head -1 || true)
+        if [[ -n "$v" ]]; then
+            HY2_CERT_DIR="$(dirname "$v")"
+        fi
+    fi
+    return 0
+}
+
+# ────────────────────────────────────────────────────────────
 #  卸载 & 清理
 # ────────────────────────────────────────────────────────────
 hy2_do_uninstall() {
     step "卸载现有 Hysteria 2 并清理所有文件"
 
+    # 必须先于删除配置之前读回证书目录
+    hy2_load_paths_from_conf
+
     systemctl stop    hysteria-server 2>/dev/null || true
     systemctl disable hysteria-server 2>/dev/null || true
     systemctl daemon-reload           2>/dev/null || true
 
+    local t
     local targets=(
         "$HY2_BIN"
         "$HY2_SERVICE"
         "$HY2_CONF_DIR"
         "/var/log/hysteria"
+        "$HY2_CLASH_FILE"
     )
     for t in "${targets[@]}"; do
         [[ -e "$t" ]] && { info "删除 $t"; rm -rf "$t"; }
     done
+
+    # 自定义证书目录（不在 /etc/hysteria 之内）：只删除脚本生成的内容，不 rm -rf 整个目录
+    if [[ "$HY2_CERT_DIR" != "${HY2_CONF_DIR}"/* ]]; then
+        cert_dir_cleanup "$HY2_CERT_DIR" server.crt server.key
+    fi
+    if [[ "$HY2_ACME_DIR" != "${HY2_CONF_DIR}"/* ]]; then
+        cert_dir_cleanup "$HY2_ACME_DIR" acme certificates locks ocsp
+    fi
 
     systemctl daemon-reload 2>/dev/null || true
     info "✅ 卸载清理完毕"
@@ -939,12 +1268,35 @@ hy2_download() {
 }
 
 # ────────────────────────────────────────────────────────────
-#  生成自签名 TLS 证书
+#  询问证书目录
+#    自签名：证书 / 私钥（server.crt / server.key）生成到该目录
+#    ACME  ：Hysteria 2 把申请到的证书、账号信息存放在该目录（续期也用它）
+#  结果写入全局 HY2_CERT_DIR / HY2_ACME_DIR
+# ────────────────────────────────────────────────────────────
+hy2_ask_cert_dir() {
+    local mode=$1
+    echo ""
+    if [[ "$mode" == "1" ]]; then
+        echo -e "  ${BOLD}ACME 证书目录${NC}"
+        echo "  Hysteria 2 申请到的证书、ACME 账号信息都保存在这里，到期续签也使用该目录。"
+        ask_cert_dir "ACME 证书目录" "$HY2_ACME_DIR_DEFAULT"
+        HY2_ACME_DIR="$CERT_DIR_RESULT"
+    else
+        echo -e "  ${BOLD}自签名证书目录${NC}"
+        echo "  生成的证书 server.crt 与私钥 server.key 将放在这里。"
+        ask_cert_dir "自签名证书目录" "$HY2_CERT_DIR_DEFAULT"
+        HY2_CERT_DIR="$CERT_DIR_RESULT"
+    fi
+    return 0
+}
+
+# ────────────────────────────────────────────────────────────
+#  生成自签名 TLS 证书（输出到 HY2_CERT_DIR）
 # ────────────────────────────────────────────────────────────
 hy2_gen_selfsigned_cert() {
     local sni=$1
     step "生成自签名 TLS 证书（P-256，有效期 3650 天，SNI=${sni}）"
-    mkdir -p "$HY2_CERT_DIR"
+    cert_dir_prepare "$HY2_CERT_DIR"
     local san="DNS:${sni}"
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
         -keyout "${HY2_CERT_DIR}/server.key" \
@@ -962,6 +1314,7 @@ hy2_gen_selfsigned_cert() {
     chmod 600 "${HY2_CERT_DIR}/server.key"
     chmod 644 "${HY2_CERT_DIR}/server.crt"
     info "✅ 证书生成完毕（CN=${sni}，客户端须配置 sni: ${sni}）"
+    info "证书: ${HY2_CERT_DIR}/server.crt    私钥: ${HY2_CERT_DIR}/server.key"
 }
 
 # ────────────────────────────────────────────────────────────
@@ -992,7 +1345,7 @@ hy2_ask_limits() {
     done
     echo -e "  ${DIM}→ 服务端将写入: up ${HY2_DL_MBPS} mbps（= 客户端下载） / down ${HY2_UL_MBPS} mbps（= 客户端上传）${NC}"
     echo -e "  ${DIM}  限速只对 Brutal 生效：客户端必须声明自己的带宽，否则走 BBR，服务端限速不起作用。${NC}"
-    echo -e "  ${DIM}  本脚本输出的 client.yaml 已带 bandwidth；用分享链接导入的客户端需自行在客户端里填写。${NC}"
+    echo -e "  ${DIM}  本脚本输出的 client.yaml 与 Clash 配置已带 bandwidth；用分享链接导入的客户端需自行在客户端里填写。${NC}"
 
     echo ""
     echo "  QUIC 路径 MTU 探测（Hysteria 2 不能指定具体 MTU 数值，只能开关探测）"
@@ -1048,11 +1401,12 @@ hy2_bw_summary() {
 }
 
 # ────────────────────────────────────────────────────────────
-#  写入 config.yaml —— ACME 模式
+#  写入 config.yaml —— ACME 模式（ACME 数据目录 = HY2_ACME_DIR）
 # ────────────────────────────────────────────────────────────
 hy2_write_config_acme() {
     local domain=$1 email=$2 password=$3 port=$4 ca=$5
-    mkdir -p "$HY2_CONF_DIR" "$HY2_ACME_DIR"
+    mkdir -p "$HY2_CONF_DIR"
+    cert_dir_prepare "$HY2_ACME_DIR"
     cat > "$HY2_CONF" <<EOF
 listen: :${port}
 
@@ -1079,7 +1433,7 @@ EOF
 }
 
 # ────────────────────────────────────────────────────────────
-#  写入 config.yaml —— 自签名模式
+#  写入 config.yaml —— 自签名模式（证书 = HY2_CERT_DIR/server.crt）
 # ────────────────────────────────────────────────────────────
 hy2_write_config_selfsigned() {
     local password=$1 port=$2
@@ -1130,19 +1484,19 @@ EOF
 }
 
 # ────────────────────────────────────────────────────────────
-#  等待 ACME 证书申请完成
+#  等待 ACME 证书申请完成（结果写入全局 HY2_CERT_FOUND）
 # ────────────────────────────────────────────────────────────
 hy2_wait_for_acme_cert() {
-    local max_wait=90
+    local max_wait=90 f
+    HY2_CERT_FOUND=""
     info "等待 Hysteria 2 自动申请证书（最多 ${max_wait}s）..."
     local i=0
     while (( i < max_wait )); do
-        local f
-        f=$(find "${HY2_ACME_DIR}" -name "*.crt" ! -name "*issuer*" 2>/dev/null | head -1)
+        f=$(find "${HY2_ACME_DIR}" -name "*.crt" ! -name "*issuer*" 2>/dev/null | head -1 || true)
         if [[ -n "$f" ]]; then
+            HY2_CERT_FOUND="$f"
             echo ""
             info "✅ 证书已就绪: $f"
-            echo "$f"
             return 0
         fi
         sleep 2; (( i += 2 ))
@@ -1181,7 +1535,7 @@ hy2_print_cert_fingerprints() {
 
     local fp_colon
     fp_colon=$(openssl x509 -in "$cert_file" -noout -fingerprint -sha256 2>/dev/null \
-               | sed -E 's/.*(sha256[: ])//I;s/SHA256 Fingerprint=//I' \
+               | sed -E 's/^.*=//' \
                | tr '[:lower:]' '[:upper:]')
 
     local fp_hex
@@ -1409,6 +1763,24 @@ EOF
         fi
     fi
 
+    # ── Clash / Mihomo 订阅格式（单节点）────────────────────
+    local c_sni c_fp="" c_insecure=0
+    if [[ "$tls_mode" == "1" ]]; then
+        c_sni="$domain"
+    else
+        c_sni="$sni"
+        c_fp="${_FP_COLON:-}"
+        if [[ -z "$c_fp" ]]; then
+            c_insecure=1
+        fi
+    fi
+    if [[ -n "$yaml_host" ]]; then
+        clash_emit "Hysteria2-${yaml_host}" "$HY2_CLASH_FILE" \
+            "$(clash_node_hy2 "Hysteria2-${yaml_host}" "$yaml_host" "$port" "$password" "$c_sni" "$c_fp" "$HY2_UL_MBPS" "$HY2_DL_MBPS" "$c_insecure")"
+    else
+        warn "未能获取到服务器地址，无法生成 Clash 配置"
+    fi
+
     # ── 服务管理命令 ────────────────────────────────────────
     box "服务管理"
     echo ""
@@ -1506,6 +1878,9 @@ install_hysteria2() {
         info "SNI 设置为: ${SNI}"
     fi
 
+    # ── 指定证书目录 ────────────────────────────────────────
+    hy2_ask_cert_dir "$TLS_MODE"
+
     echo ""
     read -rp "  监听端口（默认 443）: " PORT
     PORT=${PORT:-443}
@@ -1554,7 +1929,8 @@ install_hysteria2() {
         echo ""
         info "Hysteria 2 正在后台向 ${ACME_CA} 申请证书..."
         info "使用 HTTP challenge，请确保 TCP 80 端口已开放"
-        if CERT_FILE=$(hy2_wait_for_acme_cert 2>/dev/null); then
+        if hy2_wait_for_acme_cert; then
+            CERT_FILE="$HY2_CERT_FOUND"
             info "✅ ACME 证书申请完成，继续输出配置信息"
         else
             warn "⚠ 未在限定时间内找到证书文件（申请可能仍在进行中）"
@@ -1592,11 +1968,16 @@ AT_BIN="${AT_DIR}/sing-box"
 AT_CONF="${AT_DIR}/config.json"
 AT_SERVICE_NAME="anytls-box"
 AT_SERVICE="/etc/systemd/system/${AT_SERVICE_NAME}.service"
-AT_CERT="${AT_DIR}/cert.pem"
-AT_KEY="${AT_DIR}/private.key"
-AT_ACME_DIR="${AT_DIR}/acme"
 AT_WANTS_LINK="/etc/systemd/system/multi-user.target.wants/${AT_SERVICE_NAME}.service"
 AT_DOMAIN_RE='^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+
+# 证书目录：默认值固定不变；实际使用的 AT_CERT / AT_KEY / AT_ACME_DIR
+# 会在安装时由用户指定，或在查看 / 卸载时从 config.json 读回
+AT_CERT_DIR_DEFAULT="${AT_DIR}"          # 自签名：cert.pem / private.key
+AT_ACME_DIR_DEFAULT="${AT_DIR}/acme"     # ACME：证书 / 账号 / 锁
+AT_CERT="${AT_CERT_DIR_DEFAULT}/cert.pem"
+AT_KEY="${AT_CERT_DIR_DEFAULT}/private.key"
+AT_ACME_DIR="$AT_ACME_DIR_DEFAULT"
 
 # 全局：供分享链接 / 二维码 / 客户端配置使用
 AT_LINKS=()
@@ -1628,6 +2009,7 @@ at_json_escape() {
 }
 
 # YAML 标量：安全的纯文本原样输出（和常见写法一致），可能被误解析的才加双引号
+# （Clash 配置输出共用，见文件顶部 clash_node_* 系列函数）
 at_yaml_str() {
     local s="$1"
     if [[ "$s" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
@@ -1663,6 +2045,21 @@ at_conf_port() {
     else
         sed -nE 's/^[[:space:]]*"listen_port":[[:space:]]*([0-9]+).*$/\1/p' "$AT_CONF" | head -1 || true
     fi
+    return 0
+}
+
+# 从已有 config.json 读回证书路径（安装时可能指定了自定义目录；不依赖 jq）
+#   ACME 模式  → certificate_providers[0].data_directory → AT_ACME_DIR
+#   自签名模式 → tls.certificate_path / key_path         → AT_CERT / AT_KEY
+at_load_paths_from_conf() {
+    [[ -f "$AT_CONF" ]] || return 0
+    local v=""
+    v=$(sed -nE 's/^[[:space:]]*"data_directory":[[:space:]]*"([^"]+)".*$/\1/p' "$AT_CONF" | head -1 || true)
+    if [[ -n "$v" ]]; then AT_ACME_DIR="$v"; fi
+    v=$(sed -nE 's/^[[:space:]]*"certificate_path":[[:space:]]*"([^"]+)".*$/\1/p' "$AT_CONF" | head -1 || true)
+    if [[ -n "$v" ]]; then AT_CERT="$v"; fi
+    v=$(sed -nE 's/^[[:space:]]*"key_path":[[:space:]]*"([^"]+)".*$/\1/p' "$AT_CONF" | head -1 || true)
+    if [[ -n "$v" ]]; then AT_KEY="$v"; fi
     return 0
 }
 
@@ -1714,11 +2111,12 @@ at_is_installed() {
 at_do_uninstall() {
     # 参数 purge：彻底删除（含 ACME 证书缓存，不再询问）
     # 默认用于「重装」：会询问是否保留 ACME 证书缓存
-    local mode="${1:-keep}" port="" keep_acme=0 ans t
+    local mode="${1:-keep}" port="" keep_acme=0 ans t cdir
     step "卸载现有 AnyTLS 并清理文件"
 
-    # 先读出监听端口，稍后撤销防火墙放行规则
+    # 先读出监听端口（稍后撤销防火墙规则）和证书路径（可能是自定义目录）
     port=$(at_conf_port)
+    at_load_paths_from_conf
 
     systemctl stop    "$AT_SERVICE_NAME" 2>/dev/null || true
     systemctl disable "$AT_SERVICE_NAME" 2>/dev/null || true
@@ -1735,6 +2133,11 @@ at_do_uninstall() {
         [[ "${ans:-N}" =~ ^[Yy]$ ]] || keep_acme=1
     fi
 
+    if [[ -e "$AT_CLASH_FILE" ]]; then
+        info "删除 $AT_CLASH_FILE"
+        rm -f "$AT_CLASH_FILE"
+    fi
+
     if (( keep_acme == 1 )); then
         for t in "$AT_BIN" "$AT_CONF" "$AT_CERT" "$AT_KEY"; do
             if [[ -e "$t" ]]; then
@@ -1746,6 +2149,15 @@ at_do_uninstall() {
     elif [[ -e "$AT_DIR" ]]; then
         info "删除 $AT_DIR"
         rm -rf "$AT_DIR"
+    fi
+
+    # 自定义证书目录（不在 /etc/anytls-box 之内）：只删除脚本生成的内容，不 rm -rf 整个目录
+    cdir="$(dirname "$AT_CERT")"
+    if [[ "$cdir" != "$AT_DIR" && "$cdir" != "${AT_DIR}"/* ]]; then
+        cert_dir_cleanup "$cdir" "$(basename "$AT_CERT")" "$(basename "$AT_KEY")"
+    fi
+    if (( keep_acme == 0 )) && [[ "$AT_ACME_DIR" != "${AT_DIR}"/* ]]; then
+        cert_dir_cleanup "$AT_ACME_DIR" acme certificates locks ocsp
     fi
 
     if [[ -n "$port" ]]; then
@@ -1855,12 +2267,37 @@ at_download() {
 }
 
 # ────────────────────────────────────────────────────────────
-#  生成自签名 TLS 证书
+#  询问证书目录
+#    自签名：证书 / 私钥（cert.pem / private.key）生成到该目录
+#    ACME  ：sing-box 把申请到的证书、账号信息存放在该目录（续期也用它）
+#  结果写入全局 AT_CERT / AT_KEY / AT_ACME_DIR
+# ────────────────────────────────────────────────────────────
+at_ask_cert_dir() {
+    local mode=$1
+    echo ""
+    if [[ "$mode" == "1" ]]; then
+        echo -e "  ${BOLD}ACME 证书目录${NC}"
+        echo "  sing-box 申请到的证书、ACME 账号信息都保存在这里，到期续签也使用该目录。"
+        ask_cert_dir "ACME 证书目录" "$AT_ACME_DIR_DEFAULT"
+        AT_ACME_DIR="$CERT_DIR_RESULT"
+    else
+        echo -e "  ${BOLD}自签名证书目录${NC}"
+        echo "  生成的证书 cert.pem 与私钥 private.key 将放在这里。"
+        ask_cert_dir "自签名证书目录" "$AT_CERT_DIR_DEFAULT"
+        AT_CERT="${CERT_DIR_RESULT}/cert.pem"
+        AT_KEY="${CERT_DIR_RESULT}/private.key"
+    fi
+    return 0
+}
+
+# ────────────────────────────────────────────────────────────
+#  生成自签名 TLS 证书（输出到 AT_CERT / AT_KEY 所在目录）
 # ────────────────────────────────────────────────────────────
 at_gen_selfsigned_cert() {
     local sni=$1
     step "生成自签名 TLS 证书（P-256，有效期 3650 天，SNI=${sni}）"
     mkdir -p "$AT_DIR"
+    cert_dir_prepare "$(dirname "$AT_CERT")"
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
         -keyout "$AT_KEY" -out "$AT_CERT" \
         -days 3650 -nodes \
@@ -1875,6 +2312,7 @@ at_gen_selfsigned_cert() {
     chmod 600 "$AT_KEY"
     chmod 644 "$AT_CERT"
     info "✅ 证书生成完毕（CN=${sni}，客户端须配置 sni: ${sni}）"
+    info "证书: ${AT_CERT}    私钥: ${AT_KEY}"
 }
 
 # ────────────────────────────────────────────────────────────
@@ -1912,12 +2350,13 @@ EOF
 }
 
 # ────────────────────────────────────────────────────────────
-#  写入 config.json —— ACME 模式
+#  写入 config.json —— ACME 模式（数据目录 = AT_ACME_DIR）
 #  （sing-box 1.14+ 的 certificate_providers 写法；旧的 tls.acme 内联写法已弃用）
 # ────────────────────────────────────────────────────────────
 at_write_config_acme() {
     local domain=$1 email=$2 password=$3 port=$4 ca=$5 listen=$6
-    mkdir -p "$AT_DIR" "$AT_ACME_DIR"
+    mkdir -p "$AT_DIR"
+    cert_dir_prepare "$AT_ACME_DIR"
     cat > "$AT_CONF" <<EOF
 {
   "log": { "level": "info", "timestamp": true },
@@ -2126,35 +2565,7 @@ at_print_qr() {
 }
 
 # ────────────────────────────────────────────────────────────
-#  输出 Clash / Mihomo 节点（可直接粘贴到 proxies: 下面）
-#  自签名：用 fingerprint 固定证书；ACME：受信证书，无需 fingerprint
-# ────────────────────────────────────────────────────────────
-at_print_mihomo_snippet() {
-    local tls_mode=$1 host=$2 password=$3 port=$4 sni=$5
-
-    echo -e "${BOLD}# Clash / Mihomo 节点（粘贴到 proxies: 下面）：${NC}"
-    printf '%b' "$CYAN"
-    echo "  - name: $(at_yaml_str "AnyTLS-${host}")"
-    echo "    type: anytls"
-    echo "    server: $(at_yaml_host "$host")"
-    echo "    port: ${port}"
-    echo "    password: $(at_yaml_str "$password")"
-    echo "    udp: true"
-    echo "    sni: ${sni}"
-    if [[ "$tls_mode" == "2" && -n "$AT_FP_COLON" ]]; then
-        echo "    fingerprint: ${AT_FP_COLON}"
-        echo "    skip-cert-verify: false"
-    elif [[ "$tls_mode" == "2" ]]; then
-        echo "    skip-cert-verify: true"
-    else
-        echo "    skip-cert-verify: false"
-    fi
-    printf '%b' "$NC"
-    return 0
-}
-
-# ────────────────────────────────────────────────────────────
-#  输出 sing-box / Clash(Mihomo) 客户端配置片段
+#  输出 sing-box 客户端 outbound + Clash / Mihomo 订阅格式配置（单节点）
 # ────────────────────────────────────────────────────────────
 at_print_client_snippets() {
     local tls_mode=$1 host=$2 password=$3 port=$4 sni=$5
@@ -2212,8 +2623,8 @@ EOF
         echo -e "  ${DIM}↑ 固定服务器证书公钥（不用关闭校验，更安全）；客户端不支持时可改成 \"insecure\": true${NC}"
     fi
 
-    echo ""
-    at_print_mihomo_snippet "$tls_mode" "$host" "$password" "$port" "$sni"
+    clash_emit "AnyTLS-${host}" "$AT_CLASH_FILE" \
+        "$(clash_node_anytls "AnyTLS-${host}" "$host" "$port" "$password" "$sni" "$tls_mode" "${AT_FP_COLON:-}")"
 }
 
 # ────────────────────────────────────────────────────────────
@@ -2251,7 +2662,7 @@ at_print_client_info() {
         [[ -n "$cert_file" ]] && echo -e "  实际证书: ${CYAN}${cert_file}${NC}"
         echo -e "  ${DIM}  ✓ 全程自动管理，到期前自动续签${NC}"
     else
-        echo -e "  目录   : ${CYAN}${AT_DIR}/${NC}"
+        echo -e "  目录   : ${CYAN}$(dirname "$AT_CERT")/${NC}"
         echo -e "  证书   : ${CYAN}${AT_CERT}${NC}"
         echo -e "  私钥   : ${CYAN}${AT_KEY}${NC}"
     fi
@@ -2278,7 +2689,7 @@ at_print_client_info() {
     at_print_links "$tls_mode" "$domain" "$password" "$port" "$sni" "$server_ipv4" "$server_ipv6"
     at_print_qr
 
-    # ── 客户端配置片段 ──────────────────────────────────────
+    # ── 客户端配置片段（含 Clash / Mihomo 订阅格式）─────────
     local host
     if [[ "$tls_mode" == "1" ]]; then
         host="$domain"
@@ -2319,6 +2730,11 @@ show_anytls_existing_config() {
     local config="$AT_CONF"
     [[ -f "$config" ]] || return 1
 
+    # 证书目录可能是安装时自定义的，先从配置里读回来
+    at_load_paths_from_conf
+    AT_SPKI_B64=""
+    AT_FP_COLON=""
+
     box "当前 AnyTLS 节点"
     echo -e "  ${BOLD}配置文件${NC}: ${CYAN}${config}${NC}"
 
@@ -2328,7 +2744,7 @@ show_anytls_existing_config() {
         return 0
     fi
 
-    local port password sni domain="" tls_mode cert_file="" status
+    local port password sni domain="" tls_mode cert_file="" cert_dir status
     local server_ipv4 server_ipv6
     port=$(jq -r '.inbounds[0].listen_port // empty' "$config" 2>/dev/null || true)
     password=$(jq -r '.inbounds[0].users[0].password // empty' "$config" 2>/dev/null || true)
@@ -2336,10 +2752,12 @@ show_anytls_existing_config() {
     if jq -e '.certificate_providers[0]' "$config" &>/dev/null; then
         tls_mode="1"
         domain=$(jq -r '.certificate_providers[0].domain[0] // empty' "$config" 2>/dev/null || true)
+        cert_dir="$AT_ACME_DIR"
         cert_file=$(find "$AT_ACME_DIR" -type f -name '*.crt' ! -name '*issuer*' -print -quit 2>/dev/null || true)
     else
         tls_mode="2"
         cert_file=$(jq -r '.inbounds[0].tls.certificate_path // empty' "$config" 2>/dev/null || true)
+        cert_dir="$(dirname "${cert_file:-$AT_CERT}")"
     fi
 
     if systemctl is-active --quiet "$AT_SERVICE_NAME" 2>/dev/null; then
@@ -2357,6 +2775,7 @@ show_anytls_existing_config() {
         printf "  ${BOLD}TLS 模式${NC}:   %s\n" "自签名"
         printf "  ${BOLD}SNI${NC}:         %s\n" "${sni:-未知}"
     fi
+    printf "  ${BOLD}证书目录${NC}:   %s\n" "$cert_dir"
     [[ -n "$cert_file" ]] && printf "  ${BOLD}证书${NC}:       %s\n" "$cert_file"
 
     server_ipv4=$(hy2_get_ipv4 2>/dev/null || true)
@@ -2485,6 +2904,9 @@ install_anytls() {
         info "SNI 设置为: ${SNI}"
     fi
 
+    # ── 指定证书目录 ────────────────────────────────────────
+    at_ask_cert_dir "$TLS_MODE"
+
     echo ""
     while true; do
         read -rp "  监听端口（默认 443，TCP）: " PORT
@@ -2527,7 +2949,7 @@ install_anytls() {
         at_gen_selfsigned_cert "$SNI"
         at_write_config_selfsigned "$PASSWORD" "$PORT" "$SNI" "$LISTEN"
         info "配置文件: ${AT_CONF}"
-        info "证书目录: ${AT_DIR}"
+        info "证书目录: $(dirname "$AT_CERT")"
     fi
 
     step "校验配置"
@@ -2700,7 +3122,8 @@ re_purge() {
     pkill -f "^${RE_XRAY_BIN} run" 2>/dev/null || true
 
     for t in "$RE_XRAY_SERVICE" "${SYSTEMD_WANTS_DIR}/xray.service" "$RE_XRAY_BIN" \
-             "$RE_XRAY_CONF_DIR" "$RE_XRAY_SHARE_DIR" "$RE_XRAY_LOG_DIR" "$RE_XRAY_INFO"; do
+             "$RE_XRAY_CONF_DIR" "$RE_XRAY_SHARE_DIR" "$RE_XRAY_LOG_DIR" "$RE_XRAY_INFO" \
+             "$RE_CLASH_FILE"; do
         if [[ -e "$t" || -L "$t" ]]; then
             info "删除 $t"
             rm -rf "$t"
@@ -2713,23 +3136,26 @@ re_purge() {
         fw_close_tcp_port "$port"
     fi
     purge_verify "VLESS + REALITY" "$RE_XRAY_SERVICE" "${SYSTEMD_WANTS_DIR}/xray.service" \
-        "$RE_XRAY_BIN" "$RE_XRAY_CONF_DIR" "$RE_XRAY_SHARE_DIR" "$RE_XRAY_LOG_DIR" "$RE_XRAY_INFO"
+        "$RE_XRAY_BIN" "$RE_XRAY_CONF_DIR" "$RE_XRAY_SHARE_DIR" "$RE_XRAY_LOG_DIR" "$RE_XRAY_INFO" \
+        "$RE_CLASH_FILE"
     return 0
 }
 
 hy2_purge() {
     pkill -f "^${HY2_BIN} server" 2>/dev/null || true
-    hy2_do_uninstall
+    hy2_do_uninstall        # 内部会读回并清理自定义证书目录、Clash 配置文件
     rm -f "${SYSTEMD_WANTS_DIR}/hysteria-server.service"
     systemctl reset-failed hysteria-server 2>/dev/null || true
     purge_verify "Hysteria 2" "$HY2_BIN" "$HY2_SERVICE" "${SYSTEMD_WANTS_DIR}/hysteria-server.service" \
-        "$HY2_CONF_DIR" "/var/log/hysteria"
+        "$HY2_CONF_DIR" "/var/log/hysteria" "$HY2_CLASH_FILE" \
+        "${HY2_CERT_DIR}/server.crt" "${HY2_CERT_DIR}/server.key" "${HY2_ACME_DIR}/certificates"
     return 0
 }
 
 at_purge() {
-    at_do_uninstall purge
-    purge_verify "AnyTLS" "$AT_DIR" "$AT_SERVICE" "$AT_WANTS_LINK"
+    at_do_uninstall purge   # 内部会读回并清理自定义证书目录、Clash 配置文件
+    purge_verify "AnyTLS" "$AT_DIR" "$AT_SERVICE" "$AT_WANTS_LINK" "$AT_CLASH_FILE" \
+        "$AT_CERT" "$AT_KEY" "${AT_ACME_DIR}/certificates"
     return 0
 }
 
@@ -2768,6 +3194,10 @@ delete_nodes() {
     re_port=$(re_conf_port)
     hy2_port=$(hy2_conf_port)
     at_port=$(at_conf_port)
+
+    # 读回各节点实际使用的证书目录（可能是安装时自定义的），用于下面的删除清单
+    hy2_load_paths_from_conf
+    at_load_paths_from_conf
 
     echo "  当前检测到的节点："
     echo ""
@@ -2826,7 +3256,7 @@ delete_nodes() {
                 echo "      程序   : ${RE_XRAY_BIN}"
                 echo "      配置   : ${RE_XRAY_CONF_DIR}（含 UUID / 私钥）"
                 echo "      数据   : ${RE_XRAY_SHARE_DIR}    日志: ${RE_XRAY_LOG_DIR}"
-                echo "      客户端 : ${RE_XRAY_INFO}"
+                echo "      客户端 : ${RE_XRAY_INFO}    Clash: ${RE_CLASH_FILE}"
                 if [[ -n "$re_port" ]]; then
                     echo "      防火墙 : 移除 TCP ${re_port} 放行规则（端口无其它程序占用时）"
                 fi
@@ -2836,14 +3266,23 @@ delete_nodes() {
                 echo "      服务   : hysteria-server（停止并禁用）  ${HY2_SERVICE}"
                 echo "      程序   : ${HY2_BIN}"
                 echo "      配置   : ${HY2_CONF_DIR}（含密码 / 自签或 ACME 证书）"
-                echo "      日志   : /var/log/hysteria"
+                echo "      日志   : /var/log/hysteria    Clash: ${HY2_CLASH_FILE}"
+                if [[ "$HY2_CERT_DIR" != "${HY2_CONF_DIR}"/* && -d "$HY2_CERT_DIR" ]]; then
+                    echo "      证书目录: ${HY2_CERT_DIR}（自定义目录：仅删除 server.crt / server.key，目录为空时一并移除）"
+                fi
+                if [[ "$HY2_ACME_DIR" != "${HY2_CONF_DIR}"/* && -d "$HY2_ACME_DIR" ]]; then
+                    echo "      ACME 目录: ${HY2_ACME_DIR}（自定义目录：仅删除 acme / certificates / locks / ocsp 子目录）"
+                fi
                 ;;
             3)
                 echo -e "  ${BOLD}▸ AnyTLS（sing-box）${NC}"
                 echo "      服务   : ${AT_SERVICE_NAME}（停止并禁用）  ${AT_SERVICE}"
-                echo "      目录   : ${AT_DIR}（sing-box 程序 / 配置 / 证书）"
+                echo "      目录   : ${AT_DIR}（sing-box 程序 / 配置 / 证书）    Clash: ${AT_CLASH_FILE}"
                 if [[ -d "$AT_ACME_DIR" ]]; then
                     echo "      ACME   : ${AT_ACME_DIR}（证书缓存一并删除，同域名重新搭建需重新签发）"
+                fi
+                if [[ "$(dirname "$AT_CERT")" != "$AT_DIR" && "$(dirname "$AT_CERT")" != "${AT_DIR}"/* && -f "$AT_CERT" ]]; then
+                    echo "      证书目录: $(dirname "$AT_CERT")（自定义目录：仅删除 $(basename "$AT_CERT") / $(basename "$AT_KEY")，目录为空时一并移除）"
                 fi
                 if [[ -n "$at_port" ]]; then
                     echo "      防火墙 : 移除 TCP ${at_port} 放行规则（端口无其它程序占用时）"
