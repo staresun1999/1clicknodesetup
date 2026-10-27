@@ -3,9 +3,11 @@
 #  代理协议一键安装脚本
 #  支持：
 #    [1] VLESS + TCP + XTLS-Vision + REALITY（Xray-core）
-#    [2] Hysteria 2（ACME 自动证书 / 自签名证书）
-#    [3] AnyTLS（sing-box 内核；ACME 自动证书 / 自签名证书）
+#    [2] Hysteria 2（ACME 自动证书 / 自签名证书，可指定证书目录）
+#    [3] AnyTLS（sing-box 内核；ACME 自动证书 / 自签名证书，可指定证书目录）
 #    另含：[4] 查看已有节点配置   [5] 删除已搭建的节点（卸载并清理干净）
+#  所有节点搭建完成后，都会输出 Clash / Mihomo 订阅格式配置（单节点），
+#  并保存到 /root/clash_*.yaml
 #  支持系统：Ubuntu 20.04/22.04/24.04 | Debian 10/11/12
 #            CentOS / Rocky / AlmaLinux（仅 Hysteria 2 / AnyTLS）
 # ============================================================
@@ -62,6 +64,217 @@ box() {
 }
 
 # ════════════════════════════════════════════════════════════
+#  通用：证书目录（Hysteria 2 / AnyTLS 共用）
+#  - 路径必须是绝对路径，且只允许 字母 数字 . _ - / @ +
+#  - 拒绝直接使用 /etc /usr /root 等系统目录
+#  - 卸载时只删除脚本生成的证书文件，绝不 rm -rf 用户指定的目录
+# ════════════════════════════════════════════════════════════
+CERT_DIR_RESULT=""
+
+cert_dir_normalize() {
+    local d=$1 re='^/[A-Za-z0-9._/@+-]+$'
+    if [[ "$d" != /* ]]; then
+        warn "请填写绝对路径（以 / 开头）"
+        return 1
+    fi
+    if ! [[ "$d" =~ $re ]]; then
+        warn "路径只能包含字母、数字和 . _ - / @ +（不能有空格、引号等特殊字符）"
+        return 1
+    fi
+    d=$(readlink -m -- "$d" 2>/dev/null || echo "$d")
+    case "$d" in
+        /|/bin|/boot|/dev|/etc|/lib|/lib64|/proc|/run|/sbin|/sys|/usr|/var|/root|/home|/tmp|/mnt|/opt|/srv)
+            warn "不能直接使用系统目录 ${d}，请指定一个专用子目录（例如 ${d%/}/proxy-certs）"
+            return 1 ;;
+    esac
+    if [[ -e "$d" && ! -d "$d" ]]; then
+        warn "${d} 已存在且不是目录"
+        return 1
+    fi
+    CERT_DIR_RESULT="$d"
+    return 0
+}
+
+# 交互询问证书目录；结果写入全局 CERT_DIR_RESULT
+ask_cert_dir() {
+    local label=$1 def=$2 v
+    while true; do
+        read -rp "  ${label}（默认 ${def}）: " v
+        v=${v:-$def}
+        if cert_dir_normalize "$v"; then
+            break
+        fi
+    done
+    info "${label}: ${CERT_DIR_RESULT}"
+    return 0
+}
+
+# 创建证书目录（已存在则原样使用，不改权限）
+cert_dir_prepare() {
+    local d=$1
+    if [[ ! -d "$d" ]]; then
+        mkdir -p "$d" || error "无法创建证书目录: ${d}"
+        chmod 700 "$d"
+    fi
+    [[ -w "$d" ]] || error "证书目录不可写: ${d}"
+    return 0
+}
+
+# 清理证书目录：只删除指定的文件/子目录名；目录变空后才 rmdir
+#   用法: cert_dir_cleanup <目录> <名称1> [名称2 ...]
+cert_dir_cleanup() {
+    local d=$1 f
+    shift
+    [[ -d "$d" ]] || return 0
+    for f in "$@"; do
+        if [[ -e "$d/$f" || -L "$d/$f" ]]; then
+            info "删除 ${d}/${f}"
+            rm -rf -- "${d:?}/${f:?}"
+        fi
+    done
+    if rmdir "$d" 2>/dev/null; then
+        info "已删除空目录 ${d}"
+    fi
+    return 0
+}
+
+# ════════════════════════════════════════════════════════════
+#  通用：Clash / Mihomo 订阅格式配置（单节点）
+#  依赖 Part 3 里的 at_yaml_str / at_yaml_host（运行时才调用，顺序无关）
+# ════════════════════════════════════════════════════════════
+RE_CLASH_FILE="/root/clash_reality.yaml"
+HY2_CLASH_FILE="/root/clash_hysteria2.yaml"
+AT_CLASH_FILE="/root/clash_anytls.yaml"
+
+# VLESS + REALITY 节点（Mihomo 格式）
+#   参数: 名称 服务器 端口 UUID SNI 公钥 ShortId
+clash_node_reality() {
+    local name=$1 host=$2 port=$3 uuid=$4 sni=$5 pbk=$6 sid=$7
+    echo "  - name: $(at_yaml_str "$name")"
+    echo "    type: vless"
+    echo "    server: $(at_yaml_host "$host")"
+    echo "    port: ${port}"
+    echo "    uuid: ${uuid}"
+    echo "    network: tcp"
+    echo "    udp: true"
+    echo "    tls: true"
+    echo "    flow: xtls-rprx-vision"
+    echo "    servername: ${sni}"
+    echo "    client-fingerprint: chrome"
+    echo "    reality-opts:"
+    echo "      public-key: \"${pbk}\""
+    echo "      short-id: \"${sid}\""
+    return 0
+}
+
+# Hysteria 2 节点（Mihomo 格式）
+#   参数: 名称 服务器 端口 密码 SNI 证书指纹(可空) 客户端上传Mbps 客户端下载Mbps 是否跳过校验(0/1)
+#   有指纹 → 固定证书指纹；无指纹且 insecure=1 → 跳过校验；否则走系统信任链（ACME）
+clash_node_hy2() {
+    local name=$1 host=$2 port=$3 password=$4 sni=$5 fp=${6:-} ul=${7:-0} dl=${8:-0} insecure=${9:-0}
+    echo "  - name: $(at_yaml_str "$name")"
+    echo "    type: hysteria2"
+    echo "    server: $(at_yaml_host "$host")"
+    echo "    port: ${port}"
+    echo "    password: $(at_yaml_str "$password")"
+    echo "    sni: ${sni}"
+    if [[ -n "$fp" ]]; then
+        echo "    skip-cert-verify: false"
+        echo "    fingerprint: ${fp}"
+    elif [[ "$insecure" == "1" ]]; then
+        echo "    skip-cert-verify: true"
+    else
+        echo "    skip-cert-verify: false"
+    fi
+    if (( ul > 0 )); then
+        echo "    up: \"${ul} Mbps\""
+    fi
+    if (( dl > 0 )); then
+        echo "    down: \"${dl} Mbps\""
+    fi
+    return 0
+}
+
+# AnyTLS 节点（Mihomo 格式）
+#   参数: 名称 服务器 端口 密码 SNI TLS模式(1=ACME 2=自签名) 证书指纹(可空)
+clash_node_anytls() {
+    local name=$1 host=$2 port=$3 password=$4 sni=$5 tls_mode=$6 fp=${7:-}
+    echo "  - name: $(at_yaml_str "$name")"
+    echo "    type: anytls"
+    echo "    server: $(at_yaml_host "$host")"
+    echo "    port: ${port}"
+    echo "    password: $(at_yaml_str "$password")"
+    echo "    udp: true"
+    echo "    sni: ${sni}"
+    if [[ "$tls_mode" == "2" && -n "$fp" ]]; then
+        echo "    fingerprint: ${fp}"
+        echo "    skip-cert-verify: false"
+    elif [[ "$tls_mode" == "2" ]]; then
+        echo "    skip-cert-verify: true"
+    else
+        echo "    skip-cert-verify: false"
+    fi
+    return 0
+}
+
+# 把单个节点包装成完整的 Clash / Mihomo 配置（订阅文件内容）
+#   参数: 节点名称 节点YAML（缩进已处理好的 "  - name: ..." 块）
+clash_full_config() {
+    local name=$1 node=$2 n
+    n=$(at_yaml_str "$name")
+    cat <<EOF
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: true
+
+dns:
+  enable: true
+  ipv6: true
+  enhanced-mode: fake-ip
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+
+proxies:
+${node}
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - ${n}
+      - DIRECT
+
+rules:
+  - GEOIP,LAN,DIRECT,no-resolve
+  - GEOIP,CN,DIRECT
+  - MATCH,PROXY
+EOF
+}
+
+# 输出到终端并保存为文件
+#   参数: 节点名称 保存路径 节点YAML
+clash_emit() {
+    local name=$1 file=$2 node=$3 cfg
+    cfg=$(clash_full_config "$name" "$node")
+    printf '%s\n' "$cfg" > "$file"
+    chmod 600 "$file"
+    echo ""
+    echo -e "${BOLD}# Clash / Mihomo 订阅格式配置（单节点）：${NC}"
+    echo -e "  ${DIM}整段保存为 .yaml 即可作为配置/订阅文件导入；已有配置只需复制 proxies: 下的节点${NC}"
+    echo ""
+    printf '%b%s%b\n' "$CYAN" "$cfg" "$NC"
+    echo ""
+    info "Clash 配置已保存至 ${file}"
+    return 0
+}
+
+# ════════════════════════════════════════════════════════════
 #  必须 root
 # ════════════════════════════════════════════════════════════
 [[ $EUID -ne 0 ]] && error "请使用 root 用户运行此脚本，或使用 sudo bash $0"
@@ -81,22 +294,30 @@ show_main_menu() {
     echo "  请选择要安装的协议："
     echo ""
     echo "    [1]  VLESS + TCP + XTLS-Vision + REALITY"
-    echo "         (Xray-core，抗检测，推荐)"
+    echo "         (Xray-core，抗检测，推荐；REALITY 借用目标站证书，无需本地证书)"
     echo ""
     echo "    [2]  Hysteria 2"
-    echo "         (基于 QUIC，高速，支持 ACME 证书 / 自签名)"
+    echo "         (基于 QUIC，高速，支持 ACME 证书 / 自签名，可指定证书目录)"
     echo ""
     echo "    [3]  AnyTLS"
-    echo "         (sing-box 内核，TLS + 流量填充，支持 ACME 证书 / 自签名)"
+    echo "         (sing-box 内核，TLS + 流量填充，支持 ACME 证书 / 自签名，可指定证书目录)"
     echo ""
     echo "    [4]  查看当前已有节点配置"
     echo ""
     echo "    [5]  删除已搭建的节点"
     echo "         (卸载服务，清理程序 / 配置 / 证书 / 日志，删干净)"
     echo ""
+    echo "    [6]  多节点管理（同协议多节点 / 暂停·恢复·删除单个节点）"
+    echo ""
+    echo "    [7]  启用 / 停用协议"
+    echo "         (停止服务并取消开机自启，配置保留；随时可重新启用)"
+    echo ""
+    echo "    [8]  WARP 出口（一键套 WARP）"
+    echo "         (让 REALITY / Hysteria 2 / AnyTLS 的出口 IP 变成 Cloudflare WARP)"
+    echo ""
     echo "    [0]  退出"
     echo ""
-    read -rp "  请输入 [0/1/2/3/4/5]（默认 1）: " PROTO_CHOICE
+    read -rp "  请输入 [0-8]（默认 1）: " PROTO_CHOICE
     PROTO_CHOICE=${PROTO_CHOICE:-1}
     case "$PROTO_CHOICE" in
         1) install_reality; return ;;
@@ -104,6 +325,9 @@ show_main_menu() {
         3) install_anytls; return ;;
         4) show_existing_configs ;;
         5) delete_nodes ;;
+        6) node_manage_menu ;;
+        7) toggle_protocols ;;
+        8) warp_menu ;;
         0) echo ""; info "已退出。"; exit 0 ;;
         *) warn "无效选项，请重新运行脚本"; exit 1 ;;
     esac
@@ -195,6 +419,11 @@ show_xray_existing_config() {
         else
             warn "未安装 qrencode，无法显示二维码（可运行: apt-get install -y qrencode）"
         fi
+
+        # ── Clash / Mihomo 订阅格式（单节点）──────────────────
+        local clash_host="${server_ipv4:-$server_ipv6}"
+        clash_emit "REALITY-${clash_host}" "$RE_CLASH_FILE" \
+            "$(clash_node_reality "REALITY-${clash_host}" "$clash_host" "$port" "$uuid" "$sni" "$public_key" "$short_id")"
     else
         warn "未能生成完整分享链接，请查看 ${info_file} 或手动填写服务器公网 IP"
     fi
@@ -204,12 +433,15 @@ show_hy2_existing_config() {
     local config="${HY2_CONF:-/etc/hysteria/config.yaml}"
     [[ -f "$config" ]] || return 1
 
+    # 证书目录可能是安装时自定义的，先从配置里读回来
+    hy2_load_paths_from_conf
+
     box "当前 Hysteria 2 节点"
     echo -e "  ${BOLD}配置文件${NC}: ${CYAN}${config}${NC}"
 
     local port="" password="" domain="" email="" ca=""
     local tls_mode="" server_ipv4="" server_ipv6=""
-    local cert_file="" sni="" status
+    local cert_file="" sni="" status cert_dir=""
     port=$(sed -nE 's/^listen:[[:space:]]*:([0-9]+).*$/\1/p' "$config" | head -1)
     password=$(sed -nE 's/^[[:space:]]*password:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/p' "$config" | head -1)
     email=$(sed -nE 's/^[[:space:]]*email:[[:space:]]*//p' "$config" | head -1)
@@ -224,10 +456,12 @@ show_hy2_existing_config() {
                 sub(/^[[:space:]]*-[[:space:]]*/, ""); print; exit
             }
         ' "$config")
-        cert_file=$(find "${HY2_ACME_DIR:-/etc/hysteria/acme}" -type f -name '*.crt' ! -name '*issuer*' -print -quit 2>/dev/null || true)
+        cert_dir="${HY2_ACME_DIR:-/etc/hysteria/acme}"
+        cert_file=$(find "$cert_dir" -type f -name '*.crt' ! -name '*issuer*' -print -quit 2>/dev/null || true)
     else
         tls_mode="自签名"
-        cert_file="${HY2_CERT_DIR:-/etc/hysteria/certs}/server.crt"
+        cert_dir="${HY2_CERT_DIR:-/etc/hysteria/certs}"
+        cert_file="${cert_dir}/server.crt"
     fi
 
     if [[ -n "$cert_file" && -f "$cert_file" ]]; then
@@ -235,7 +469,7 @@ show_hy2_existing_config() {
             | sed -nE 's/^subject=.*CN=([^,]+).*$/\1/p')
     fi
 
-    if systemctl is-active --quiet hysteria-server 2>/dev/null; then
+    if systemctl is-active --quiet "${HY2_SVC_NAME:-hysteria-server}" 2>/dev/null; then
         status="运行中"
     else
         status="未运行"
@@ -248,6 +482,7 @@ show_hy2_existing_config() {
     [[ -n "$sni" ]] && printf "  ${BOLD}SNI${NC}:         %s\n" "$sni"
     [[ -n "$email" ]] && printf "  ${BOLD}ACME 邮箱${NC}:  %s\n" "$email"
     [[ -n "$ca" ]] && printf "  ${BOLD}ACME CA${NC}:    %s\n" "$ca"
+    printf "  ${BOLD}证书目录${NC}:   %s\n" "$cert_dir"
     [[ -n "$cert_file" ]] && printf "  ${BOLD}证书${NC}:       %s\n" "$cert_file"
 
     local bw_up bw_down
@@ -261,10 +496,21 @@ show_hy2_existing_config() {
         printf "  ${BOLD}MTU 探测${NC}:   已关闭\n"
     fi
 
+    # 服务端 up/down 与客户端相反：转换成「客户端上传 / 下载」供 Clash 配置使用
+    HY2_UL_MBPS=0
+    HY2_DL_MBPS=0
+    if [[ "$bw_up" =~ ^([0-9]+)[[:space:]]+[Mm]bps ]]; then
+        HY2_DL_MBPS=$(( 10#${BASH_REMATCH[1]} ))
+    fi
+    if [[ "$bw_down" =~ ^([0-9]+)[[:space:]]+[Mm]bps ]]; then
+        HY2_UL_MBPS=$(( 10#${BASH_REMATCH[1]} ))
+    fi
+
     server_ipv4=$(hy2_get_ipv4 2>/dev/null || true)
     server_ipv6=$(hy2_get_ipv6 2>/dev/null || true)
     echo ""
     _FP_B64=""
+    _FP_COLON=""
     if [[ "$tls_mode" == "自签名" && -f "$cert_file" ]]; then
         hy2_print_cert_fingerprints "$cert_file"
     fi
@@ -305,6 +551,26 @@ show_hy2_existing_config() {
         fi
     fi
 
+    # ── Clash / Mihomo 订阅格式（单节点）──────────────────────
+    local c_host="" c_sni="" c_fp="" c_insecure=0
+    if [[ "$tls_mode" == "ACME" ]]; then
+        c_host="$domain"
+        c_sni="$domain"
+    else
+        c_host="${server_ipv4:-$server_ipv6}"
+        c_sni="$sni"
+        c_fp="${_FP_COLON:-}"
+        if [[ -z "$c_fp" ]]; then
+            c_insecure=1
+        fi
+    fi
+    if [[ -n "$c_host" && -n "$c_sni" && -n "$password" && -n "$port" ]]; then
+        clash_emit "Hysteria2-${c_host}${HY2_NODE_TAG:-}" "$HY2_CLASH_FILE" \
+            "$(clash_node_hy2 "Hysteria2-${c_host}${HY2_NODE_TAG:-}" "$c_host" "$port" "$password" "$c_sni" "$c_fp" "$HY2_UL_MBPS" "$HY2_DL_MBPS" "$c_insecure")"
+    else
+        warn "未能从配置中提取完整信息，无法生成 Clash 配置"
+    fi
+
     echo ""
     echo -e "  ${BOLD}原始配置（前 80 行）:${NC}"
     sed -n '1,80p' "$config"
@@ -323,6 +589,9 @@ show_existing_configs() {
     fi
     if show_anytls_existing_config; then
         found=1
+    fi
+    if (( found == 1 )); then
+        show_extra_nodes_all || true
     fi
     if (( found == 0 )); then
         warn "未找到本脚本创建的 Xray、Hysteria 2 或 AnyTLS 配置"
@@ -479,6 +748,10 @@ re_gen_keys() {
 # ────────────────────────────────────────────────────────────
 re_interactive_config() {
     step "交互式配置"
+
+    echo -e "${YELLOW}提示：REALITY 不使用本地证书（握手时借用 target 站点的真实证书），因此这里没有「证书目录」可指定；${NC}"
+    echo -e "${YELLOW}      如需指定证书目录，请使用 Hysteria 2 / AnyTLS。${NC}"
+    echo ""
 
     read -rp "$(echo -e "${CYAN}请输入监听端口 [默认 443]：${NC}")" INPUT_PORT
     RE_PORT="${INPUT_PORT:-443}"
@@ -669,6 +942,11 @@ re_print_client_info() {
         fi
     fi
 
+    # ── Clash / Mihomo 订阅格式（单节点，优先 IPv4）────────────
+    local clash_host="${server_ipv4:-$server_ipv6}"
+    clash_emit "REALITY-${clash_host}" "$RE_CLASH_FILE" \
+        "$(clash_node_reality "REALITY-${clash_host}" "$clash_host" "$RE_PORT" "$RE_UUID" "$RE_SERVER_NAME" "$RE_PUBLIC_KEY" "$RE_SHORT_ID")"
+
     local info_file="/root/xray_reality_client.txt"
     cat > "${info_file}" <<EOF
 VLESS + REALITY 客户端配置
@@ -688,6 +966,9 @@ ShortId    : ${RE_SHORT_ID}
 分享链接：
 $( [[ -n "$link_v4" ]] && echo "[IPv4] ${link_v4}" )
 $( [[ -n "$link_v6" ]] && echo "[IPv6] ${link_v6}" )
+
+Clash / Mihomo 订阅配置（单节点）：
+  ${RE_CLASH_FILE}
 
 服务管理命令：
   查看状态  : systemctl status xray
@@ -713,6 +994,22 @@ install_reality() {
     echo -e "${NC}"
     echo -e "  ${BOLD}VLESS + TCP + XTLS-Vision + REALITY 一键安装脚本${NC}"
     echo -e "  基于 XTLS/Xray-core 官方最新版本\n"
+
+    if [[ -x "$RE_XRAY_BIN" && -f "$RE_XRAY_CONF" ]]; then
+        warn "检测到系统已安装 REALITY（Xray）"
+        echo ""
+        echo "  [1] 覆盖重装（会清除该协议的全部节点）"
+        echo "  [2] 新增一个节点（保留现有节点）"
+        echo "  [3] 退出，不做任何操作"
+        echo ""
+        local re_choice
+        read -rp "请选择 [1/2/3]（默认 3）: " re_choice
+        case "${re_choice:-3}" in
+            1) rm -f /root/clash_reality_*.yaml "${PAUSED_DIR}"/re-*.json ;;
+            2) re_add_node || true; return 0 ;;
+            *) info "已取消，退出。"; exit 0 ;;
+        esac
+    fi
 
     re_detect_os
     re_install_deps
@@ -750,12 +1047,22 @@ HY2_BIN="/usr/local/bin/hysteria"
 HY2_CONF_DIR="/etc/hysteria"
 HY2_CONF="${HY2_CONF_DIR}/config.yaml"
 HY2_SERVICE="/etc/systemd/system/hysteria-server.service"
-HY2_CERT_DIR="${HY2_CONF_DIR}/certs"
-HY2_ACME_DIR="${HY2_CONF_DIR}/acme"
+HY2_SVC_NAME="hysteria-server"      # 额外节点会在函数内临时覆盖
+HY2_NODE_TAG=""                     # Clash 节点名后缀（额外节点用）
+
+# 证书目录：默认值固定不变；实际使用的 HY2_CERT_DIR / HY2_ACME_DIR
+# 会在安装时由用户指定，或在查看 / 卸载时从 config.yaml 读回
+HY2_CERT_DIR_DEFAULT="${HY2_CONF_DIR}/certs"
+HY2_ACME_DIR_DEFAULT="${HY2_CONF_DIR}/acme"
+HY2_CERT_DIR="$HY2_CERT_DIR_DEFAULT"     # 自签名证书目录（server.crt / server.key）
+HY2_ACME_DIR="$HY2_ACME_DIR_DEFAULT"     # ACME 数据目录（证书 / 账号 / 锁）
 
 # 全局：证书指纹（供 URI 使用）
 _FP_B64=""
 _FP_COLON=""
+
+# 全局：ACME 等待结果（避免命令替换吞掉输出）
+HY2_CERT_FOUND=""
 
 # 全局：带宽限制（按「客户端实际速度」记录，单位 Mbps，0 = 不限速）与 MTU 探测开关
 HY2_UL_MBPS=50     # 客户端上传
@@ -770,24 +1077,60 @@ hy2_is_installed() {
 }
 
 # ────────────────────────────────────────────────────────────
+#  从已有 config.yaml 读回证书目录（安装时可能指定了自定义目录）
+#    ACME 模式  → acme.dir          → HY2_ACME_DIR
+#    自签名模式 → tls.cert 所在目录 → HY2_CERT_DIR
+# ────────────────────────────────────────────────────────────
+hy2_load_paths_from_conf() {
+    [[ -f "$HY2_CONF" ]] || return 0
+    local v=""
+    if grep -q '^acme:' "$HY2_CONF"; then
+        v=$(sed -nE 's/^[[:space:]]*dir:[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1/p' "$HY2_CONF" | head -1 || true)
+        if [[ -n "$v" ]]; then
+            HY2_ACME_DIR="$v"
+        fi
+    else
+        v=$(sed -nE 's/^[[:space:]]*cert:[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1/p' "$HY2_CONF" | head -1 || true)
+        if [[ -n "$v" ]]; then
+            HY2_CERT_DIR="$(dirname "$v")"
+        fi
+    fi
+    return 0
+}
+
+# ────────────────────────────────────────────────────────────
 #  卸载 & 清理
 # ────────────────────────────────────────────────────────────
 hy2_do_uninstall() {
     step "卸载现有 Hysteria 2 并清理所有文件"
+    hy2_purge_extras
+
+    # 必须先于删除配置之前读回证书目录
+    hy2_load_paths_from_conf
 
     systemctl stop    hysteria-server 2>/dev/null || true
     systemctl disable hysteria-server 2>/dev/null || true
     systemctl daemon-reload           2>/dev/null || true
 
+    local t
     local targets=(
         "$HY2_BIN"
         "$HY2_SERVICE"
         "$HY2_CONF_DIR"
         "/var/log/hysteria"
+        "$HY2_CLASH_FILE"
     )
     for t in "${targets[@]}"; do
         [[ -e "$t" ]] && { info "删除 $t"; rm -rf "$t"; }
     done
+
+    # 自定义证书目录（不在 /etc/hysteria 之内）：只删除脚本生成的内容，不 rm -rf 整个目录
+    if [[ "$HY2_CERT_DIR" != "${HY2_CONF_DIR}"/* ]]; then
+        cert_dir_cleanup "$HY2_CERT_DIR" server.crt server.key
+    fi
+    if [[ "$HY2_ACME_DIR" != "${HY2_CONF_DIR}"/* ]]; then
+        cert_dir_cleanup "$HY2_ACME_DIR" acme certificates locks ocsp
+    fi
 
     systemctl daemon-reload 2>/dev/null || true
     info "✅ 卸载清理完毕"
@@ -958,12 +1301,35 @@ hy2_download() {
 }
 
 # ────────────────────────────────────────────────────────────
-#  生成自签名 TLS 证书
+#  询问证书目录
+#    自签名：证书 / 私钥（server.crt / server.key）生成到该目录
+#    ACME  ：Hysteria 2 把申请到的证书、账号信息存放在该目录（续期也用它）
+#  结果写入全局 HY2_CERT_DIR / HY2_ACME_DIR
+# ────────────────────────────────────────────────────────────
+hy2_ask_cert_dir() {
+    local mode=$1
+    echo ""
+    if [[ "$mode" == "1" ]]; then
+        echo -e "  ${BOLD}ACME 证书目录${NC}"
+        echo "  Hysteria 2 申请到的证书、ACME 账号信息都保存在这里，到期续签也使用该目录。"
+        ask_cert_dir "ACME 证书目录" "$HY2_ACME_DIR_DEFAULT"
+        HY2_ACME_DIR="$CERT_DIR_RESULT"
+    else
+        echo -e "  ${BOLD}自签名证书目录${NC}"
+        echo "  生成的证书 server.crt 与私钥 server.key 将放在这里。"
+        ask_cert_dir "自签名证书目录" "$HY2_CERT_DIR_DEFAULT"
+        HY2_CERT_DIR="$CERT_DIR_RESULT"
+    fi
+    return 0
+}
+
+# ────────────────────────────────────────────────────────────
+#  生成自签名 TLS 证书（输出到 HY2_CERT_DIR）
 # ────────────────────────────────────────────────────────────
 hy2_gen_selfsigned_cert() {
     local sni=$1
     step "生成自签名 TLS 证书（P-256，有效期 3650 天，SNI=${sni}）"
-    mkdir -p "$HY2_CERT_DIR"
+    cert_dir_prepare "$HY2_CERT_DIR"
     local san="DNS:${sni}"
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
         -keyout "${HY2_CERT_DIR}/server.key" \
@@ -981,6 +1347,7 @@ hy2_gen_selfsigned_cert() {
     chmod 600 "${HY2_CERT_DIR}/server.key"
     chmod 644 "${HY2_CERT_DIR}/server.crt"
     info "✅ 证书生成完毕（CN=${sni}，客户端须配置 sni: ${sni}）"
+    info "证书: ${HY2_CERT_DIR}/server.crt    私钥: ${HY2_CERT_DIR}/server.key"
 }
 
 # ────────────────────────────────────────────────────────────
@@ -1011,7 +1378,7 @@ hy2_ask_limits() {
     done
     echo -e "  ${DIM}→ 服务端将写入: up ${HY2_DL_MBPS} mbps（= 客户端下载） / down ${HY2_UL_MBPS} mbps（= 客户端上传）${NC}"
     echo -e "  ${DIM}  限速只对 Brutal 生效：客户端必须声明自己的带宽，否则走 BBR，服务端限速不起作用。${NC}"
-    echo -e "  ${DIM}  本脚本输出的 client.yaml 已带 bandwidth；用分享链接导入的客户端需自行在客户端里填写。${NC}"
+    echo -e "  ${DIM}  本脚本输出的 client.yaml 与 Clash 配置已带 bandwidth；用分享链接导入的客户端需自行在客户端里填写。${NC}"
 
     echo ""
     echo "  QUIC 路径 MTU 探测（Hysteria 2 不能指定具体 MTU 数值，只能开关探测）"
@@ -1067,11 +1434,12 @@ hy2_bw_summary() {
 }
 
 # ────────────────────────────────────────────────────────────
-#  写入 config.yaml —— ACME 模式
+#  写入 config.yaml —— ACME 模式（ACME 数据目录 = HY2_ACME_DIR）
 # ────────────────────────────────────────────────────────────
 hy2_write_config_acme() {
     local domain=$1 email=$2 password=$3 port=$4 ca=$5
-    mkdir -p "$HY2_CONF_DIR" "$HY2_ACME_DIR"
+    mkdir -p "$HY2_CONF_DIR"
+    cert_dir_prepare "$HY2_ACME_DIR"
     cat > "$HY2_CONF" <<EOF
 listen: :${port}
 
@@ -1098,7 +1466,7 @@ EOF
 }
 
 # ────────────────────────────────────────────────────────────
-#  写入 config.yaml —— 自签名模式
+#  写入 config.yaml —— 自签名模式（证书 = HY2_CERT_DIR/server.crt）
 # ────────────────────────────────────────────────────────────
 hy2_write_config_selfsigned() {
     local password=$1 port=$2
@@ -1149,19 +1517,19 @@ EOF
 }
 
 # ────────────────────────────────────────────────────────────
-#  等待 ACME 证书申请完成
+#  等待 ACME 证书申请完成（结果写入全局 HY2_CERT_FOUND）
 # ────────────────────────────────────────────────────────────
 hy2_wait_for_acme_cert() {
-    local max_wait=90
+    local max_wait=90 f
+    HY2_CERT_FOUND=""
     info "等待 Hysteria 2 自动申请证书（最多 ${max_wait}s）..."
     local i=0
     while (( i < max_wait )); do
-        local f
-        f=$(find "${HY2_ACME_DIR}" -name "*.crt" ! -name "*issuer*" 2>/dev/null | head -1)
+        f=$(find "${HY2_ACME_DIR}" -name "*.crt" ! -name "*issuer*" 2>/dev/null | head -1 || true)
         if [[ -n "$f" ]]; then
+            HY2_CERT_FOUND="$f"
             echo ""
             info "✅ 证书已就绪: $f"
-            echo "$f"
             return 0
         fi
         sleep 2; (( i += 2 ))
@@ -1200,7 +1568,7 @@ hy2_print_cert_fingerprints() {
 
     local fp_colon
     fp_colon=$(openssl x509 -in "$cert_file" -noout -fingerprint -sha256 2>/dev/null \
-               | sed -E 's/.*(sha256[: ])//I;s/SHA256 Fingerprint=//I' \
+               | sed -E 's/^.*=//' \
                | tr '[:lower:]' '[:upper:]')
 
     local fp_hex
@@ -1428,23 +1796,41 @@ EOF
         fi
     fi
 
+    # ── Clash / Mihomo 订阅格式（单节点）────────────────────
+    local c_sni c_fp="" c_insecure=0
+    if [[ "$tls_mode" == "1" ]]; then
+        c_sni="$domain"
+    else
+        c_sni="$sni"
+        c_fp="${_FP_COLON:-}"
+        if [[ -z "$c_fp" ]]; then
+            c_insecure=1
+        fi
+    fi
+    if [[ -n "$yaml_host" ]]; then
+        clash_emit "Hysteria2-${yaml_host}${HY2_NODE_TAG:-}" "$HY2_CLASH_FILE" \
+            "$(clash_node_hy2 "Hysteria2-${yaml_host}${HY2_NODE_TAG:-}" "$yaml_host" "$port" "$password" "$c_sni" "$c_fp" "$HY2_UL_MBPS" "$HY2_DL_MBPS" "$c_insecure")"
+    else
+        warn "未能获取到服务器地址，无法生成 Clash 配置"
+    fi
+
     # ── 服务管理命令 ────────────────────────────────────────
     box "服务管理"
     echo ""
-    printf "  ${BOLD}%-14s${NC}  ${CYAN}%s${NC}\n" "启动服务"   "systemctl start   hysteria-server"
-    printf "  ${BOLD}%-14s${NC}  ${CYAN}%s${NC}\n" "停止服务"   "systemctl stop    hysteria-server"
-    printf "  ${BOLD}%-14s${NC}  ${CYAN}%s${NC}\n" "重启服务"   "systemctl restart hysteria-server"
-    printf "  ${BOLD}%-14s${NC}  ${CYAN}%s${NC}\n" "查看状态"   "systemctl status  hysteria-server"
-    printf "  ${BOLD}%-14s${NC}  ${CYAN}%s${NC}\n" "实时日志"   "journalctl -u hysteria-server -f"
+    printf "  ${BOLD}%-14s${NC}  ${CYAN}%s${NC}\n" "启动服务"   "systemctl start   ${HY2_SVC_NAME:-hysteria-server}"
+    printf "  ${BOLD}%-14s${NC}  ${CYAN}%s${NC}\n" "停止服务"   "systemctl stop    ${HY2_SVC_NAME:-hysteria-server}"
+    printf "  ${BOLD}%-14s${NC}  ${CYAN}%s${NC}\n" "重启服务"   "systemctl restart ${HY2_SVC_NAME:-hysteria-server}"
+    printf "  ${BOLD}%-14s${NC}  ${CYAN}%s${NC}\n" "查看状态"   "systemctl status  ${HY2_SVC_NAME:-hysteria-server}"
+    printf "  ${BOLD}%-14s${NC}  ${CYAN}%s${NC}\n" "实时日志"   "journalctl -u ${HY2_SVC_NAME:-hysteria-server} -f"
     printf "  ${BOLD}%-14s${NC}  ${CYAN}%s${NC}\n" "编辑配置"   "nano ${HY2_CONF}"
     echo ""
     hr
-    if systemctl is-active --quiet hysteria-server 2>/dev/null; then
+    if systemctl is-active --quiet "${HY2_SVC_NAME:-hysteria-server}" 2>/dev/null; then
         echo -e "  服务状态:  ${GREEN}${BOLD}● 运行中 ✅${NC}"
     else
         echo -e "  服务状态:  ${RED}${BOLD}✗ 未运行${NC}"
         warn "服务可能启动失败，查看日志:"
-        echo -e "  ${CYAN}journalctl -u hysteria-server --no-pager | tail -20${NC}"
+        echo -e "  ${CYAN}journalctl -u ${HY2_SVC_NAME:-hysteria-server} --no-pager | tail -20${NC}"
     fi
     hr
     echo ""
@@ -1464,14 +1850,16 @@ install_hysteria2() {
         echo ""
         warn "检测到系统已安装 Hysteria 2"
         echo ""
-        echo "  [1] 卸载后重新安装（推荐）"
+        echo "  [1] 卸载后重新安装（会清除该协议的全部节点）"
         echo "  [2] 仅卸载，不重新安装"
-        echo "  [3] 退出，不做任何操作"
+        echo "  [3] 新增一个节点（保留现有节点）"
+        echo "  [4] 退出，不做任何操作"
         echo ""
-        read -rp "请选择 [1/2/3]（默认 1）: " choice
+        read -rp "请选择 [1/2/3/4]（默认 1）: " choice
         case "${choice:-1}" in
             1) hy2_do_uninstall ;;
             2) hy2_do_uninstall; echo ""; info "卸载完成。"; exit 0 ;;
+            3) hy2_add_node || true; return 0 ;;
             *) info "已取消，退出。"; exit 0 ;;
         esac
     fi
@@ -1525,6 +1913,9 @@ install_hysteria2() {
         info "SNI 设置为: ${SNI}"
     fi
 
+    # ── 指定证书目录 ────────────────────────────────────────
+    hy2_ask_cert_dir "$TLS_MODE"
+
     echo ""
     read -rp "  监听端口（默认 443）: " PORT
     PORT=${PORT:-443}
@@ -1573,12 +1964,13 @@ install_hysteria2() {
         echo ""
         info "Hysteria 2 正在后台向 ${ACME_CA} 申请证书..."
         info "使用 HTTP challenge，请确保 TCP 80 端口已开放"
-        if CERT_FILE=$(hy2_wait_for_acme_cert 2>/dev/null); then
+        if hy2_wait_for_acme_cert; then
+            CERT_FILE="$HY2_CERT_FOUND"
             info "✅ ACME 证书申请完成，继续输出配置信息"
         else
             warn "⚠ 未在限定时间内找到证书文件（申请可能仍在进行中）"
             warn "  可能原因: TCP 80 未开放 / 域名未正确解析 / CA 响应慢"
-            warn "  查看日志: journalctl -u hysteria-server -f"
+            warn "  查看日志: journalctl -u ${HY2_SVC_NAME:-hysteria-server} -f"
             CERT_FILE=""
         fi
     else
@@ -1591,7 +1983,7 @@ install_hysteria2() {
         if systemctl is-active --quiet hysteria-server; then
             info "systemd 服务已启动"
         else
-            warn "服务启动可能失败，请查看日志: journalctl -u hysteria-server -f"
+            warn "服务启动可能失败，请查看日志: journalctl -u ${HY2_SVC_NAME:-hysteria-server} -f"
         fi
         CERT_FILE="${HY2_CERT_DIR}/server.crt"
     fi
@@ -1611,11 +2003,16 @@ AT_BIN="${AT_DIR}/sing-box"
 AT_CONF="${AT_DIR}/config.json"
 AT_SERVICE_NAME="anytls-box"
 AT_SERVICE="/etc/systemd/system/${AT_SERVICE_NAME}.service"
-AT_CERT="${AT_DIR}/cert.pem"
-AT_KEY="${AT_DIR}/private.key"
-AT_ACME_DIR="${AT_DIR}/acme"
 AT_WANTS_LINK="/etc/systemd/system/multi-user.target.wants/${AT_SERVICE_NAME}.service"
 AT_DOMAIN_RE='^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
+
+# 证书目录：默认值固定不变；实际使用的 AT_CERT / AT_KEY / AT_ACME_DIR
+# 会在安装时由用户指定，或在查看 / 卸载时从 config.json 读回
+AT_CERT_DIR_DEFAULT="${AT_DIR}"          # 自签名：cert.pem / private.key
+AT_ACME_DIR_DEFAULT="${AT_DIR}/acme"     # ACME：证书 / 账号 / 锁
+AT_CERT="${AT_CERT_DIR_DEFAULT}/cert.pem"
+AT_KEY="${AT_CERT_DIR_DEFAULT}/private.key"
+AT_ACME_DIR="$AT_ACME_DIR_DEFAULT"
 
 # 全局：供分享链接 / 二维码 / 客户端配置使用
 AT_LINKS=()
@@ -1647,6 +2044,7 @@ at_json_escape() {
 }
 
 # YAML 标量：安全的纯文本原样输出（和常见写法一致），可能被误解析的才加双引号
+# （Clash 配置输出共用，见文件顶部 clash_node_* 系列函数）
 at_yaml_str() {
     local s="$1"
     if [[ "$s" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
@@ -1682,6 +2080,21 @@ at_conf_port() {
     else
         sed -nE 's/^[[:space:]]*"listen_port":[[:space:]]*([0-9]+).*$/\1/p' "$AT_CONF" | head -1 || true
     fi
+    return 0
+}
+
+# 从已有 config.json 读回证书路径（安装时可能指定了自定义目录；不依赖 jq）
+#   ACME 模式  → certificate_providers[0].data_directory → AT_ACME_DIR
+#   自签名模式 → tls.certificate_path / key_path         → AT_CERT / AT_KEY
+at_load_paths_from_conf() {
+    [[ -f "$AT_CONF" ]] || return 0
+    local v=""
+    v=$(sed -nE 's/^[[:space:]]*"data_directory":[[:space:]]*"([^"]+)".*$/\1/p' "$AT_CONF" | head -1 || true)
+    if [[ -n "$v" ]]; then AT_ACME_DIR="$v"; fi
+    v=$(sed -nE 's/^[[:space:]]*"certificate_path":[[:space:]]*"([^"]+)".*$/\1/p' "$AT_CONF" | head -1 || true)
+    if [[ -n "$v" ]]; then AT_CERT="$v"; fi
+    v=$(sed -nE 's/^[[:space:]]*"key_path":[[:space:]]*"([^"]+)".*$/\1/p' "$AT_CONF" | head -1 || true)
+    if [[ -n "$v" ]]; then AT_KEY="$v"; fi
     return 0
 }
 
@@ -1733,11 +2146,14 @@ at_is_installed() {
 at_do_uninstall() {
     # 参数 purge：彻底删除（含 ACME 证书缓存，不再询问）
     # 默认用于「重装」：会询问是否保留 ACME 证书缓存
-    local mode="${1:-keep}" port="" keep_acme=0 ans t
+    local mode="${1:-keep}" port="" keep_acme=0 ans t cdir
     step "卸载现有 AnyTLS 并清理文件"
+    rm -f /root/clash_anytls_*.yaml "${PAUSED_DIR}"/at-*.json
 
-    # 先读出监听端口，稍后撤销防火墙放行规则
+    # 先读出监听端口（稍后撤销防火墙规则）和证书路径（可能是自定义目录）
     port=$(at_conf_port)
+    at_load_paths_from_conf
+    rm -f "$(dirname "$AT_CERT")"/cert-[0-9]*.pem "$(dirname "$AT_CERT")"/private-[0-9]*.key 2>/dev/null || true
 
     systemctl stop    "$AT_SERVICE_NAME" 2>/dev/null || true
     systemctl disable "$AT_SERVICE_NAME" 2>/dev/null || true
@@ -1754,6 +2170,11 @@ at_do_uninstall() {
         [[ "${ans:-N}" =~ ^[Yy]$ ]] || keep_acme=1
     fi
 
+    if [[ -e "$AT_CLASH_FILE" ]]; then
+        info "删除 $AT_CLASH_FILE"
+        rm -f "$AT_CLASH_FILE"
+    fi
+
     if (( keep_acme == 1 )); then
         for t in "$AT_BIN" "$AT_CONF" "$AT_CERT" "$AT_KEY"; do
             if [[ -e "$t" ]]; then
@@ -1765,6 +2186,15 @@ at_do_uninstall() {
     elif [[ -e "$AT_DIR" ]]; then
         info "删除 $AT_DIR"
         rm -rf "$AT_DIR"
+    fi
+
+    # 自定义证书目录（不在 /etc/anytls-box 之内）：只删除脚本生成的内容，不 rm -rf 整个目录
+    cdir="$(dirname "$AT_CERT")"
+    if [[ "$cdir" != "$AT_DIR" && "$cdir" != "${AT_DIR}"/* ]]; then
+        cert_dir_cleanup "$cdir" "$(basename "$AT_CERT")" "$(basename "$AT_KEY")"
+    fi
+    if (( keep_acme == 0 )) && [[ "$AT_ACME_DIR" != "${AT_DIR}"/* ]]; then
+        cert_dir_cleanup "$AT_ACME_DIR" acme certificates locks ocsp
     fi
 
     if [[ -n "$port" ]]; then
@@ -1874,12 +2304,37 @@ at_download() {
 }
 
 # ────────────────────────────────────────────────────────────
-#  生成自签名 TLS 证书
+#  询问证书目录
+#    自签名：证书 / 私钥（cert.pem / private.key）生成到该目录
+#    ACME  ：sing-box 把申请到的证书、账号信息存放在该目录（续期也用它）
+#  结果写入全局 AT_CERT / AT_KEY / AT_ACME_DIR
+# ────────────────────────────────────────────────────────────
+at_ask_cert_dir() {
+    local mode=$1
+    echo ""
+    if [[ "$mode" == "1" ]]; then
+        echo -e "  ${BOLD}ACME 证书目录${NC}"
+        echo "  sing-box 申请到的证书、ACME 账号信息都保存在这里，到期续签也使用该目录。"
+        ask_cert_dir "ACME 证书目录" "$AT_ACME_DIR_DEFAULT"
+        AT_ACME_DIR="$CERT_DIR_RESULT"
+    else
+        echo -e "  ${BOLD}自签名证书目录${NC}"
+        echo "  生成的证书 cert.pem 与私钥 private.key 将放在这里。"
+        ask_cert_dir "自签名证书目录" "$AT_CERT_DIR_DEFAULT"
+        AT_CERT="${CERT_DIR_RESULT}/cert.pem"
+        AT_KEY="${CERT_DIR_RESULT}/private.key"
+    fi
+    return 0
+}
+
+# ────────────────────────────────────────────────────────────
+#  生成自签名 TLS 证书（输出到 AT_CERT / AT_KEY 所在目录）
 # ────────────────────────────────────────────────────────────
 at_gen_selfsigned_cert() {
     local sni=$1
     step "生成自签名 TLS 证书（P-256，有效期 3650 天，SNI=${sni}）"
     mkdir -p "$AT_DIR"
+    cert_dir_prepare "$(dirname "$AT_CERT")"
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
         -keyout "$AT_KEY" -out "$AT_CERT" \
         -days 3650 -nodes \
@@ -1894,6 +2349,7 @@ at_gen_selfsigned_cert() {
     chmod 600 "$AT_KEY"
     chmod 644 "$AT_CERT"
     info "✅ 证书生成完毕（CN=${sni}，客户端须配置 sni: ${sni}）"
+    info "证书: ${AT_CERT}    私钥: ${AT_KEY}"
 }
 
 # ────────────────────────────────────────────────────────────
@@ -1931,12 +2387,13 @@ EOF
 }
 
 # ────────────────────────────────────────────────────────────
-#  写入 config.json —— ACME 模式
+#  写入 config.json —— ACME 模式（数据目录 = AT_ACME_DIR）
 #  （sing-box 1.14+ 的 certificate_providers 写法；旧的 tls.acme 内联写法已弃用）
 # ────────────────────────────────────────────────────────────
 at_write_config_acme() {
     local domain=$1 email=$2 password=$3 port=$4 ca=$5 listen=$6
-    mkdir -p "$AT_DIR" "$AT_ACME_DIR"
+    mkdir -p "$AT_DIR"
+    cert_dir_prepare "$AT_ACME_DIR"
     cat > "$AT_CONF" <<EOF
 {
   "log": { "level": "info", "timestamp": true },
@@ -2145,35 +2602,7 @@ at_print_qr() {
 }
 
 # ────────────────────────────────────────────────────────────
-#  输出 Clash / Mihomo 节点（可直接粘贴到 proxies: 下面）
-#  自签名：用 fingerprint 固定证书；ACME：受信证书，无需 fingerprint
-# ────────────────────────────────────────────────────────────
-at_print_mihomo_snippet() {
-    local tls_mode=$1 host=$2 password=$3 port=$4 sni=$5
-
-    echo -e "${BOLD}# Clash / Mihomo 节点（粘贴到 proxies: 下面）：${NC}"
-    printf '%b' "$CYAN"
-    echo "  - name: $(at_yaml_str "AnyTLS-${host}")"
-    echo "    type: anytls"
-    echo "    server: $(at_yaml_host "$host")"
-    echo "    port: ${port}"
-    echo "    password: $(at_yaml_str "$password")"
-    echo "    udp: true"
-    echo "    sni: ${sni}"
-    if [[ "$tls_mode" == "2" && -n "$AT_FP_COLON" ]]; then
-        echo "    fingerprint: ${AT_FP_COLON}"
-        echo "    skip-cert-verify: false"
-    elif [[ "$tls_mode" == "2" ]]; then
-        echo "    skip-cert-verify: true"
-    else
-        echo "    skip-cert-verify: false"
-    fi
-    printf '%b' "$NC"
-    return 0
-}
-
-# ────────────────────────────────────────────────────────────
-#  输出 sing-box / Clash(Mihomo) 客户端配置片段
+#  输出 sing-box 客户端 outbound + Clash / Mihomo 订阅格式配置（单节点）
 # ────────────────────────────────────────────────────────────
 at_print_client_snippets() {
     local tls_mode=$1 host=$2 password=$3 port=$4 sni=$5
@@ -2231,8 +2660,8 @@ EOF
         echo -e "  ${DIM}↑ 固定服务器证书公钥（不用关闭校验，更安全）；客户端不支持时可改成 \"insecure\": true${NC}"
     fi
 
-    echo ""
-    at_print_mihomo_snippet "$tls_mode" "$host" "$password" "$port" "$sni"
+    clash_emit "AnyTLS-${host}" "$AT_CLASH_FILE" \
+        "$(clash_node_anytls "AnyTLS-${host}" "$host" "$port" "$password" "$sni" "$tls_mode" "${AT_FP_COLON:-}")"
 }
 
 # ────────────────────────────────────────────────────────────
@@ -2270,7 +2699,7 @@ at_print_client_info() {
         [[ -n "$cert_file" ]] && echo -e "  实际证书: ${CYAN}${cert_file}${NC}"
         echo -e "  ${DIM}  ✓ 全程自动管理，到期前自动续签${NC}"
     else
-        echo -e "  目录   : ${CYAN}${AT_DIR}/${NC}"
+        echo -e "  目录   : ${CYAN}$(dirname "$AT_CERT")/${NC}"
         echo -e "  证书   : ${CYAN}${AT_CERT}${NC}"
         echo -e "  私钥   : ${CYAN}${AT_KEY}${NC}"
     fi
@@ -2297,7 +2726,7 @@ at_print_client_info() {
     at_print_links "$tls_mode" "$domain" "$password" "$port" "$sni" "$server_ipv4" "$server_ipv6"
     at_print_qr
 
-    # ── 客户端配置片段 ──────────────────────────────────────
+    # ── 客户端配置片段（含 Clash / Mihomo 订阅格式）─────────
     local host
     if [[ "$tls_mode" == "1" ]]; then
         host="$domain"
@@ -2338,6 +2767,11 @@ show_anytls_existing_config() {
     local config="$AT_CONF"
     [[ -f "$config" ]] || return 1
 
+    # 证书目录可能是安装时自定义的，先从配置里读回来
+    at_load_paths_from_conf
+    AT_SPKI_B64=""
+    AT_FP_COLON=""
+
     box "当前 AnyTLS 节点"
     echo -e "  ${BOLD}配置文件${NC}: ${CYAN}${config}${NC}"
 
@@ -2347,7 +2781,7 @@ show_anytls_existing_config() {
         return 0
     fi
 
-    local port password sni domain="" tls_mode cert_file="" status
+    local port password sni domain="" tls_mode cert_file="" cert_dir status
     local server_ipv4 server_ipv6
     port=$(jq -r '.inbounds[0].listen_port // empty' "$config" 2>/dev/null || true)
     password=$(jq -r '.inbounds[0].users[0].password // empty' "$config" 2>/dev/null || true)
@@ -2355,10 +2789,12 @@ show_anytls_existing_config() {
     if jq -e '.certificate_providers[0]' "$config" &>/dev/null; then
         tls_mode="1"
         domain=$(jq -r '.certificate_providers[0].domain[0] // empty' "$config" 2>/dev/null || true)
+        cert_dir="$AT_ACME_DIR"
         cert_file=$(find "$AT_ACME_DIR" -type f -name '*.crt' ! -name '*issuer*' -print -quit 2>/dev/null || true)
     else
         tls_mode="2"
         cert_file=$(jq -r '.inbounds[0].tls.certificate_path // empty' "$config" 2>/dev/null || true)
+        cert_dir="$(dirname "${cert_file:-$AT_CERT}")"
     fi
 
     if systemctl is-active --quiet "$AT_SERVICE_NAME" 2>/dev/null; then
@@ -2376,6 +2812,7 @@ show_anytls_existing_config() {
         printf "  ${BOLD}TLS 模式${NC}:   %s\n" "自签名"
         printf "  ${BOLD}SNI${NC}:         %s\n" "${sni:-未知}"
     fi
+    printf "  ${BOLD}证书目录${NC}:   %s\n" "$cert_dir"
     [[ -n "$cert_file" ]] && printf "  ${BOLD}证书${NC}:       %s\n" "$cert_file"
 
     server_ipv4=$(hy2_get_ipv4 2>/dev/null || true)
@@ -2425,15 +2862,17 @@ install_anytls() {
         echo ""
         warn "检测到系统已安装 AnyTLS"
         echo ""
-        echo "  [1] 卸载后重新安装（推荐）"
+        echo "  [1] 卸载后重新安装（会清除该协议的全部节点）"
         echo "  [2] 仅卸载，不重新安装"
-        echo "  [3] 退出，不做任何操作"
+        echo "  [3] 新增一个节点（保留现有节点）"
+        echo "  [4] 退出，不做任何操作"
         echo ""
         local choice
-        read -rp "请选择 [1/2/3]（默认 1）: " choice
+        read -rp "请选择 [1/2/3/4]（默认 1）: " choice
         case "${choice:-1}" in
             1) at_do_uninstall ;;
             2) at_do_uninstall; echo ""; info "卸载完成。"; exit 0 ;;
+            3) at_add_node || true; return 0 ;;
             *) info "已取消，退出。"; exit 0 ;;
         esac
     fi
@@ -2504,6 +2943,9 @@ install_anytls() {
         info "SNI 设置为: ${SNI}"
     fi
 
+    # ── 指定证书目录 ────────────────────────────────────────
+    at_ask_cert_dir "$TLS_MODE"
+
     echo ""
     while true; do
         read -rp "  监听端口（默认 443，TCP）: " PORT
@@ -2546,7 +2988,7 @@ install_anytls() {
         at_gen_selfsigned_cert "$SNI"
         at_write_config_selfsigned "$PASSWORD" "$PORT" "$SNI" "$LISTEN"
         info "配置文件: ${AT_CONF}"
-        info "证书目录: ${AT_DIR}"
+        info "证书目录: $(dirname "$AT_CERT")"
     fi
 
     step "校验配置"
@@ -2719,12 +3161,14 @@ re_purge() {
     pkill -f "^${RE_XRAY_BIN} run" 2>/dev/null || true
 
     for t in "$RE_XRAY_SERVICE" "${SYSTEMD_WANTS_DIR}/xray.service" "$RE_XRAY_BIN" \
-             "$RE_XRAY_CONF_DIR" "$RE_XRAY_SHARE_DIR" "$RE_XRAY_LOG_DIR" "$RE_XRAY_INFO"; do
+             "$RE_XRAY_CONF_DIR" "$RE_XRAY_SHARE_DIR" "$RE_XRAY_LOG_DIR" "$RE_XRAY_INFO" \
+             "$RE_CLASH_FILE"; do
         if [[ -e "$t" || -L "$t" ]]; then
             info "删除 $t"
             rm -rf "$t"
         fi
     done
+    rm -f /root/clash_reality_*.yaml "${PAUSED_DIR}"/re-*.json
     systemctl daemon-reload 2>/dev/null || true
     systemctl reset-failed xray 2>/dev/null || true
 
@@ -2732,23 +3176,26 @@ re_purge() {
         fw_close_tcp_port "$port"
     fi
     purge_verify "VLESS + REALITY" "$RE_XRAY_SERVICE" "${SYSTEMD_WANTS_DIR}/xray.service" \
-        "$RE_XRAY_BIN" "$RE_XRAY_CONF_DIR" "$RE_XRAY_SHARE_DIR" "$RE_XRAY_LOG_DIR" "$RE_XRAY_INFO"
+        "$RE_XRAY_BIN" "$RE_XRAY_CONF_DIR" "$RE_XRAY_SHARE_DIR" "$RE_XRAY_LOG_DIR" "$RE_XRAY_INFO" \
+        "$RE_CLASH_FILE"
     return 0
 }
 
 hy2_purge() {
     pkill -f "^${HY2_BIN} server" 2>/dev/null || true
-    hy2_do_uninstall
+    hy2_do_uninstall        # 内部会读回并清理自定义证书目录、Clash 配置文件
     rm -f "${SYSTEMD_WANTS_DIR}/hysteria-server.service"
     systemctl reset-failed hysteria-server 2>/dev/null || true
     purge_verify "Hysteria 2" "$HY2_BIN" "$HY2_SERVICE" "${SYSTEMD_WANTS_DIR}/hysteria-server.service" \
-        "$HY2_CONF_DIR" "/var/log/hysteria"
+        "$HY2_CONF_DIR" "/var/log/hysteria" "$HY2_CLASH_FILE" \
+        "${HY2_CERT_DIR}/server.crt" "${HY2_CERT_DIR}/server.key" "${HY2_ACME_DIR}/certificates"
     return 0
 }
 
 at_purge() {
-    at_do_uninstall purge
-    purge_verify "AnyTLS" "$AT_DIR" "$AT_SERVICE" "$AT_WANTS_LINK"
+    at_do_uninstall purge   # 内部会读回并清理自定义证书目录、Clash 配置文件
+    purge_verify "AnyTLS" "$AT_DIR" "$AT_SERVICE" "$AT_WANTS_LINK" "$AT_CLASH_FILE" \
+        "$AT_CERT" "$AT_KEY" "${AT_ACME_DIR}/certificates"
     return 0
 }
 
@@ -2787,6 +3234,10 @@ delete_nodes() {
     re_port=$(re_conf_port)
     hy2_port=$(hy2_conf_port)
     at_port=$(at_conf_port)
+
+    # 读回各节点实际使用的证书目录（可能是安装时自定义的），用于下面的删除清单
+    hy2_load_paths_from_conf
+    at_load_paths_from_conf
 
     echo "  当前检测到的节点："
     echo ""
@@ -2845,7 +3296,7 @@ delete_nodes() {
                 echo "      程序   : ${RE_XRAY_BIN}"
                 echo "      配置   : ${RE_XRAY_CONF_DIR}（含 UUID / 私钥）"
                 echo "      数据   : ${RE_XRAY_SHARE_DIR}    日志: ${RE_XRAY_LOG_DIR}"
-                echo "      客户端 : ${RE_XRAY_INFO}"
+                echo "      客户端 : ${RE_XRAY_INFO}    Clash: ${RE_CLASH_FILE}"
                 if [[ -n "$re_port" ]]; then
                     echo "      防火墙 : 移除 TCP ${re_port} 放行规则（端口无其它程序占用时）"
                 fi
@@ -2855,14 +3306,23 @@ delete_nodes() {
                 echo "      服务   : hysteria-server（停止并禁用）  ${HY2_SERVICE}"
                 echo "      程序   : ${HY2_BIN}"
                 echo "      配置   : ${HY2_CONF_DIR}（含密码 / 自签或 ACME 证书）"
-                echo "      日志   : /var/log/hysteria"
+                echo "      日志   : /var/log/hysteria    Clash: ${HY2_CLASH_FILE}"
+                if [[ "$HY2_CERT_DIR" != "${HY2_CONF_DIR}"/* && -d "$HY2_CERT_DIR" ]]; then
+                    echo "      证书目录: ${HY2_CERT_DIR}（自定义目录：仅删除 server.crt / server.key，目录为空时一并移除）"
+                fi
+                if [[ "$HY2_ACME_DIR" != "${HY2_CONF_DIR}"/* && -d "$HY2_ACME_DIR" ]]; then
+                    echo "      ACME 目录: ${HY2_ACME_DIR}（自定义目录：仅删除 acme / certificates / locks / ocsp 子目录）"
+                fi
                 ;;
             3)
                 echo -e "  ${BOLD}▸ AnyTLS（sing-box）${NC}"
                 echo "      服务   : ${AT_SERVICE_NAME}（停止并禁用）  ${AT_SERVICE}"
-                echo "      目录   : ${AT_DIR}（sing-box 程序 / 配置 / 证书）"
+                echo "      目录   : ${AT_DIR}（sing-box 程序 / 配置 / 证书）    Clash: ${AT_CLASH_FILE}"
                 if [[ -d "$AT_ACME_DIR" ]]; then
                     echo "      ACME   : ${AT_ACME_DIR}（证书缓存一并删除，同域名重新搭建需重新签发）"
+                fi
+                if [[ "$(dirname "$AT_CERT")" != "$AT_DIR" && "$(dirname "$AT_CERT")" != "${AT_DIR}"/* && -f "$AT_CERT" ]]; then
+                    echo "      证书目录: $(dirname "$AT_CERT")（自定义目录：仅删除 $(basename "$AT_CERT") / $(basename "$AT_KEY")，目录为空时一并移除）"
                 fi
                 if [[ -n "$at_port" ]]; then
                     echo "      防火墙 : 移除 TCP ${at_port} 放行规则（端口无其它程序占用时）"
@@ -2898,6 +3358,1475 @@ delete_nodes() {
     return 0
 }
 
+
+# ╔══════════════════════════════════════════════════════════╗
+# ║   PART 5 — 多节点 / 启用·停用协议 / WARP 出口             ║
+# ╚══════════════════════════════════════════════════════════╝
+#  设计约定：
+#   · 每个协议的「第一个节点」= 原有安装流程创建的节点（主节点）
+#   · 额外节点：
+#       REALITY → Xray config.json 里追加 inbound（同一进程）
+#       AnyTLS  → sing-box config.json 里追加 inbound（同一进程）
+#       Hy2     → 独立实例：/etc/hysteria/config-N.yaml + hysteria-server-N.service
+#   · 所有对现有配置的修改都是：备份 → 修改 → 校验 → 重启 → 失败自动回滚
+
+pause_any() { local _; read -rp "按回车继续..." _ || true; }
+
+need_jq() {
+    command -v jq &>/dev/null && return 0
+    info "安装 jq ..."
+    if command -v apt-get &>/dev/null; then
+        apt-get install -y -qq jq >/dev/null 2>&1 || true
+    elif command -v dnf &>/dev/null; then
+        dnf install -y -q jq >/dev/null 2>&1 || true
+    elif command -v yum &>/dev/null; then
+        yum install -y -q jq >/dev/null 2>&1 || true
+    fi
+    if ! command -v jq &>/dev/null; then
+        warn "缺少 jq，无法继续（请手动安装: apt-get install -y jq）"
+        return 1
+    fi
+    return 0
+}
+
+# ────────────────────────────────────────────────────────────
+#  端口 / 防火墙
+# ────────────────────────────────────────────────────────────
+udp_port_in_use() {
+    local hex
+    local -a files=(/proc/net/udp)
+    hex=$(printf '%04X' "$1")
+    [[ -r /proc/net/udp6 ]] && files+=(/proc/net/udp6)
+    awk -v p=":${hex}\$" 'FNR>1 && $2 ~ p {f=1} END{exit !f}' "${files[@]}" 2>/dev/null
+}
+
+# 所有 Hysteria 2 配置文件（主节点 + 额外节点）
+hy2_all_confs() {
+    local f
+    if [[ -f "$HY2_CONF" ]]; then echo "$HY2_CONF"; fi
+    for f in "${HY2_CONF_DIR}"/config-*.yaml; do
+        if [[ -f "$f" ]]; then echo "$f"; fi
+    done
+    return 0
+}
+
+# 额外 Hysteria 2 节点的配置文件（不含主节点）
+hy2_extra_confs() {
+    local f
+    for f in "${HY2_CONF_DIR}"/config-*.yaml; do
+        if [[ -f "$f" ]]; then echo "$f"; fi
+    done
+    return 0
+}
+
+hy2_conf_index() { local n=${1##*/config-}; echo "${n%.yaml}"; }
+
+# 当前配置里（运行中的 inbound）占用的 TCP 端口
+active_tcp_ports() {
+    command -v jq &>/dev/null || return 0
+    if [[ -f "$RE_XRAY_CONF" ]]; then
+        jq -r '.inbounds[]? | .port // empty' "$RE_XRAY_CONF" 2>/dev/null || true
+    fi
+    if [[ -f "$AT_CONF" ]]; then
+        jq -r '.inbounds[]? | .listen_port // empty' "$AT_CONF" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# 已在本脚本配置里占用的端口（含已暂停节点，防止恢复时冲突）
+# tcp: Xray + AnyTLS；udp: Hysteria 2
+configured_ports() {
+    local proto=$1 f b
+    if [[ "$proto" == "tcp" ]]; then
+        active_tcp_ports
+        for f in "${PAUSED_DIR:-/etc/proxy-paused}"/re-*.json "${PAUSED_DIR:-/etc/proxy-paused}"/at-*.json; do
+            [[ -f "$f" ]] || continue
+            b=${f##*/}; b=${b#*-}; echo "${b%.json}"
+        done
+    else
+        for f in $(hy2_all_confs); do
+            sed -nE 's/^listen:[[:space:]]*:([0-9]+).*$/\1/p' "$f" | head -1 || true
+        done
+    fi
+    return 0
+}
+
+# 询问新节点端口；结果写入 NEW_PORT。参数: tcp|udp 默认端口
+NEW_PORT=""
+ask_new_port() {
+    local proto=$1 def=$2 p ans used
+    while true; do
+        read -rp "  监听端口（${proto}，默认 ${def}）: " p
+        p=${p:-$def}
+        if ! [[ "$p" =~ ^[0-9]+$ ]] || (( 10#$p < 1 || 10#$p > 65535 )); then
+            warn "端口无效，请输入 1-65535 之间的数字"
+            continue
+        fi
+        p=$(( 10#$p ))
+        used=$(configured_ports "$proto")
+        if grep -qx "$p" <<< "$used"; then
+            warn "${proto} 端口 ${p} 已被本脚本的其它节点占用，请换一个"
+            continue
+        fi
+        if { [[ "$proto" == "tcp" ]] && at_port_in_use "$p"; } \
+           || { [[ "$proto" == "udp" ]] && udp_port_in_use "$p"; }; then
+            warn "${proto} 端口 ${p} 当前已被其它程序占用"
+            read -rp "  仍要使用该端口吗？[y/N]: " ans
+            [[ "${ans:-N}" =~ ^[Yy]$ ]] || continue
+        fi
+        NEW_PORT=$p
+        return 0
+    done
+}
+
+# 放行端口（ufw / firewalld / iptables）。参数: 端口 协议 备注
+fw_open_port() {
+    local p=$1 proto=${2:-tcp} note=${3:-proxy}
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "${p}/${proto}" comment "$note" >/dev/null 2>&1 || true
+        info "ufw 已放行 ${p}/${proto}"
+    elif command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null; then
+        firewall-cmd --permanent --add-port="${p}/${proto}" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        info "firewalld 已放行 ${p}/${proto}"
+    elif command -v iptables &>/dev/null; then
+        iptables -C INPUT -p "$proto" --dport "$p" -j ACCEPT 2>/dev/null \
+            || iptables -I INPUT -p "$proto" --dport "$p" -j ACCEPT 2>/dev/null || true
+        if command -v ip6tables &>/dev/null; then
+            ip6tables -C INPUT -p "$proto" --dport "$p" -j ACCEPT 2>/dev/null \
+                || ip6tables -I INPUT -p "$proto" --dport "$p" -j ACCEPT 2>/dev/null || true
+        fi
+        info "iptables 已放行 ${p}/${proto}（重启后失效，如需持久化请自行保存规则）"
+    else
+        warn "未检测到防火墙，请确认端口 ${p}/${proto} 可访问"
+    fi
+    warn "如果云服务商控制台有安全组/防火墙，请同时放行 ${proto^^} ${p}"
+    return 0
+}
+
+fw_close_udp_port() {
+    local p=$1 ipt
+    [[ "$p" =~ ^[0-9]+$ ]] || return 0
+    if udp_port_in_use "$p"; then return 0; fi
+    if command -v ufw &>/dev/null; then
+        ufw --force delete allow "${p}/udp" >/dev/null 2>&1 || true
+    fi
+    if command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null; then
+        firewall-cmd --permanent --remove-port="${p}/udp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+    for ipt in iptables ip6tables; do
+        command -v "$ipt" &>/dev/null || continue
+        "$ipt" -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
+    done
+    return 0
+}
+
+# 协议当前是否处于「被停用」状态（服务既没运行、也没设开机自启）
+svc_is_stopped() {
+    ! systemctl is-active --quiet "$1" 2>/dev/null && ! systemctl is-enabled --quiet "$1" 2>/dev/null
+}
+
+# ════════════════════════════════════════════════════════════
+#  5.1  REALITY 多节点
+# ════════════════════════════════════════════════════════════
+re_show_node() {
+    local idx=$1 conf="$RE_XRAY_CONF"
+    local port uuid sni sid priv pk="" ipv4 ipv6 host link_v4="" link_v6="" name
+    port=$(jq -r ".inbounds[$idx].port // empty" "$conf" 2>/dev/null || true)
+    uuid=$(jq -r ".inbounds[$idx].settings.clients[0].id // empty" "$conf" 2>/dev/null || true)
+    sni=$(jq -r ".inbounds[$idx].streamSettings.realitySettings.serverNames[0] // empty" "$conf" 2>/dev/null || true)
+    sid=$(jq -r ".inbounds[$idx].streamSettings.realitySettings.shortIds[0] // empty" "$conf" 2>/dev/null || true)
+    priv=$(jq -r ".inbounds[$idx].streamSettings.realitySettings.privateKey // empty" "$conf" 2>/dev/null || true)
+    if [[ -n "$priv" && -x "$RE_XRAY_BIN" ]]; then
+        pk=$("$RE_XRAY_BIN" x25519 -i "$priv" 2>/dev/null \
+            | awk -F': *' 'tolower($0) ~ /public ?key|password/ {print $NF; exit}' || true)
+    fi
+    if [[ -z "$port" || -z "$uuid" || -z "$pk" ]]; then
+        warn "无法从配置里读取第 $((idx+1)) 个 REALITY 节点的完整信息"
+        return 0
+    fi
+
+    ipv4=$(hy2_get_ipv4 2>/dev/null || true)
+    ipv6=$(hy2_get_ipv6 2>/dev/null || true)
+    printf "  ${BOLD}端口${NC}:       %s\n" "$port"
+    printf "  ${BOLD}UUID${NC}:        %s\n" "$uuid"
+    printf "  ${BOLD}SNI${NC}:         %s\n" "$sni"
+    printf "  ${BOLD}ShortId${NC}:     %s\n" "$sid"
+    printf "  ${BOLD}公钥 (pbk)${NC}:  %s\n" "$pk"
+
+    if [[ -n "$ipv4" ]]; then
+        link_v4="vless://${uuid}@${ipv4}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pk}&sid=${sid}&type=raw&headerType=none#REALITY-${ipv4}-${port}"
+    fi
+    if [[ -n "$ipv6" ]]; then
+        link_v6="vless://${uuid}@[${ipv6}]:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pk}&sid=${sid}&type=raw&headerType=none#REALITY-v6-${ipv6}-${port}"
+    fi
+    echo ""
+    echo -e "  ${BOLD}${GREEN}VLESS 分享链接:${NC}"
+    if [[ -n "$link_v4" ]]; then echo -e "  ${DIM}[IPv4]${NC}"; echo "  ${link_v4}"; fi
+    if [[ -n "$link_v6" ]]; then echo -e "  ${DIM}[IPv6]${NC}"; echo "  ${link_v6}"; fi
+    if command -v qrencode &>/dev/null; then
+        if [[ -n "$link_v4" ]]; then qrencode -t ansiutf8 "$link_v4"; fi
+    fi
+
+    host="${ipv4:-$ipv6}"
+    if [[ -n "$host" ]]; then
+        name="REALITY-${host}-${port}"
+        clash_emit "$name" "/root/clash_reality_${port}.yaml" \
+            "$(clash_node_reality "$name" "$host" "$port" "$uuid" "$sni" "$pk" "$sid")"
+    fi
+    return 0
+}
+
+re_add_node() {
+    step "新增 VLESS + REALITY 节点"
+    if [[ ! -f "$RE_XRAY_CONF" || ! -x "$RE_XRAY_BIN" ]]; then
+        warn "尚未安装 REALITY，请先在主菜单选择 [1] 安装"
+        return 1
+    fi
+    need_jq || return 1
+
+    local port target_host sni uuid keys priv pub sid tag tmp bak n
+    ask_new_port tcp 8443
+    port=$NEW_PORT
+
+    echo -e "${YELLOW}提示：target 需支持 TLSv1.3 + H2，且 IP 不在 CDN 上${NC}"
+    echo -e "${YELLOW}推荐：dl.google.com | www.microsoft.com | addons.mozilla.org | cdn.jsdelivr.net${NC}"
+    read -rp "  伪装目标域名（默认 dl.google.com）: " target_host
+    target_host=${target_host:-dl.google.com}
+    read -rp "  serverName（默认 ${target_host}）: " sni
+    sni=${sni:-$target_host}
+
+    uuid=$("$RE_XRAY_BIN" uuid)
+    keys=$("$RE_XRAY_BIN" x25519)
+    priv=$(echo "$keys" | grep 'PrivateKey:' | awk '{print $NF}')
+    pub=$(echo "$keys" | grep -i 'Password\|PublicKey' | awk '{print $NF}')
+    sid=$(openssl rand -hex 8)
+    [[ -n "$priv" && -n "$pub" ]] || { warn "密钥生成失败"; return 1; }
+    tag="reality-${port}"
+
+    bak="${RE_XRAY_CONF}.addnode.bak"
+    cp -a "$RE_XRAY_CONF" "$bak"
+    tmp=$(mktemp)
+    jq --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg target "${target_host}:443" \
+       --arg sni "$sni" --arg priv "$priv" --arg sid "$sid" '
+       .inbounds += [{
+         listen: "::", port: $port, protocol: "vless", tag: $tag,
+         settings: { clients: [ { id: $uuid, flow: "xtls-rprx-vision" } ], decryption: "none" },
+         streamSettings: {
+           network: "raw", security: "reality",
+           realitySettings: {
+             show: false, target: $target, xver: 0, serverNames: [ $sni ],
+             privateKey: $priv, maxTimeDiff: 70000, shortIds: [ $sid, "" ]
+           }
+         },
+         sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] }
+       }]' "$RE_XRAY_CONF" > "$tmp" || { rm -f "$tmp"; warn "写入配置失败"; return 1; }
+
+    if ! "$RE_XRAY_BIN" run -test -config "$tmp" >/dev/null 2>&1; then
+        warn "新配置校验失败，已放弃（原配置未改动）"
+        rm -f "$tmp"
+        return 1
+    fi
+    cat "$tmp" > "$RE_XRAY_CONF"
+    rm -f "$tmp"
+
+    RE_PORT=$port
+    re_configure_firewall
+
+    if svc_is_stopped xray; then
+        warn "REALITY 当前处于停用状态：节点已写入配置，启用该协议后生效"
+    else
+        systemctl restart xray
+        sleep 2
+        if ! systemctl is-active --quiet xray; then
+            warn "Xray 重启失败，正在回滚配置..."
+            cp -a "$bak" "$RE_XRAY_CONF"
+            systemctl restart xray || true
+            return 1
+        fi
+        info "Xray 已重启，新节点生效 ✔"
+    fi
+
+    n=$(jq '.inbounds | length' "$RE_XRAY_CONF")
+    box "新节点信息（REALITY #${n}）"
+    re_show_node $(( n - 1 ))
+    return 0
+}
+
+# ════════════════════════════════════════════════════════════
+#  5.2  AnyTLS 多节点
+# ════════════════════════════════════════════════════════════
+at_show_node() {
+    local idx=$1 conf="$AT_CONF"
+    local port password sni prov domain="" tls_mode cert_file="" ipv4 ipv6 host name
+    port=$(jq -r ".inbounds[$idx].listen_port // empty" "$conf" 2>/dev/null || true)
+    password=$(jq -r ".inbounds[$idx].users[0].password // empty" "$conf" 2>/dev/null || true)
+    sni=$(jq -r ".inbounds[$idx].tls.server_name // empty" "$conf" 2>/dev/null || true)
+    prov=$(jq -r ".inbounds[$idx].tls.certificate_provider // empty" "$conf" 2>/dev/null || true)
+    at_load_paths_from_conf
+    AT_SPKI_B64=""
+    AT_FP_COLON=""
+    if [[ -n "$prov" ]]; then
+        tls_mode=1
+        domain=$(jq -r --arg t "$prov" '.certificate_providers[]? | select(.tag == $t) | .domain[0] // empty' "$conf" 2>/dev/null || true)
+        cert_file=$(find "$AT_ACME_DIR" -type f -name "${domain:-__none__}.crt" -print -quit 2>/dev/null || true)
+    else
+        tls_mode=2
+        cert_file=$(jq -r ".inbounds[$idx].tls.certificate_path // empty" "$conf" 2>/dev/null || true)
+    fi
+    if [[ -z "$port" || -z "$password" ]]; then
+        warn "无法从配置里读取第 $((idx+1)) 个 AnyTLS 节点的完整信息"
+        return 0
+    fi
+
+    printf "  ${BOLD}端口${NC}:       %s\n" "$port"
+    printf "  ${BOLD}认证密码${NC}:   %s\n" "$password"
+    if (( tls_mode == 1 )); then
+        printf "  ${BOLD}TLS 模式${NC}:   ACME（域名 %s）\n" "${domain:-未知}"
+    else
+        printf "  ${BOLD}TLS 模式${NC}:   自签名（SNI %s）\n" "${sni:-未知}"
+        [[ -f "$cert_file" ]] && at_print_cert_fingerprint "$cert_file"
+    fi
+
+    ipv4=$(hy2_get_ipv4 2>/dev/null || true)
+    ipv6=$(hy2_get_ipv6 2>/dev/null || true)
+    echo ""
+    at_print_links "$tls_mode" "$domain" "$password" "$port" "$sni" "$ipv4" "$ipv6"
+    at_print_qr
+
+    if (( tls_mode == 1 )); then host="$domain"; else host="${ipv4:-$ipv6}"; fi
+    if [[ -n "$host" ]]; then
+        name="AnyTLS-${host}-${port}"
+        clash_emit "$name" "/root/clash_anytls_${port}.yaml" \
+            "$(clash_node_anytls "$name" "$host" "$port" "$password" "${sni:-$domain}" "$tls_mode" "${AT_FP_COLON:-}")"
+    fi
+    return 0
+}
+
+at_add_node() {
+    step "新增 AnyTLS 节点"
+    if [[ ! -f "$AT_CONF" || ! -x "$AT_BIN" ]]; then
+        warn "尚未安装 AnyTLS，请先在主菜单选择 [3] 安装"
+        return 1
+    fi
+    need_jq || return 1
+    at_load_paths_from_conf
+
+    local TLS_MODE DOMAIN="" EMAIL="" ACME_CA="letsencrypt" SNI="" PASSWORD PORT
+    local tag prov_tag="" certp="" keyp="" cdir listen sni_val ans ca_choice tmp bak n
+    local email_re='^[^@"[:space:]]+@[^@"[:space:]]+\.[^@"[:space:]]+$'
+
+    echo "  TLS 证书模式：  [1] ACME 自动申请（需域名 + TCP 80）   [2] 自签名证书"
+    read -rp "  请选择 [1/2]（默认 2）: " TLS_MODE
+    TLS_MODE=${TLS_MODE:-2}
+    [[ "$TLS_MODE" == "1" || "$TLS_MODE" == "2" ]] || { warn "无效的证书模式"; return 1; }
+
+    if [[ "$TLS_MODE" == "1" ]]; then
+        read -rp "  域名（需已解析到本机）: " DOMAIN
+        DOMAIN=$(echo "$DOMAIN" | sed -E 's|^https?://||;s|/.*||;s/[[:space:]]//g')
+        at_valid_domain "$DOMAIN" || { warn "域名格式不正确"; return 1; }
+        read -rp "  邮箱: " EMAIL
+        EMAIL=$(echo "$EMAIL" | sed -E 's/[[:space:]]//g')
+        [[ "$EMAIL" =~ $email_re ]] || { warn "邮箱格式不正确"; return 1; }
+        read -rp "  证书机构 [1] Let's Encrypt（默认） [2] ZeroSSL: " ca_choice
+        [[ "${ca_choice:-1}" == "2" ]] && ACME_CA="zerossl" || ACME_CA="letsencrypt"
+        warn "ACME 的 HTTP 验证需要占用 TCP 80；若已有其它 ACME 节点正在申请/续期，可能短暂冲突"
+        sni_val="$DOMAIN"
+    else
+        read -rp "  SNI 域名（默认 bing.com）: " SNI
+        SNI=${SNI:-bing.com}
+        SNI=$(echo "$SNI" | sed -E 's|^https?://||;s|/.*||;s/[[:space:]]//g')
+        at_valid_domain "$SNI" || { warn "SNI 必须是合法域名"; return 1; }
+        sni_val="$SNI"
+    fi
+
+    ask_new_port tcp 8443
+    PORT=$NEW_PORT
+    PASSWORD=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    read -rp "  认证密码（默认随机: ${PASSWORD}）: " ans
+    PASSWORD=${ans:-$PASSWORD}
+    tag="anytls-in-${PORT}"
+    listen=$(at_listen_addr)
+
+    if [[ "$TLS_MODE" == "1" ]]; then
+        prov_tag="acme-${PORT}"
+        cert_dir_prepare "$AT_ACME_DIR"
+    else
+        cdir=$(dirname "$AT_CERT")
+        certp="${cdir}/cert-${PORT}.pem"
+        keyp="${cdir}/private-${PORT}.key"
+        (
+            AT_CERT="$certp"; AT_KEY="$keyp"
+            at_gen_selfsigned_cert "$SNI"
+        )
+    fi
+
+    bak="${AT_CONF}.addnode.bak"
+    cp -a "$AT_CONF" "$bak"
+    tmp=$(mktemp)
+    jq --arg tag "$tag" --argjson port "$PORT" --arg listen "$listen" --arg pw "$PASSWORD" \
+       --arg sni "$sni_val" --arg cert "$certp" --arg key "$keyp" --arg prov "$prov_tag" \
+       --arg domain "$DOMAIN" --arg adir "$AT_ACME_DIR" --arg email "$EMAIL" --arg ca "$ACME_CA" '
+       .inbounds += [{
+         type: "anytls", tag: $tag, listen: $listen, listen_port: $port,
+         users: [ { name: ("user-" + ($port | tostring)), password: $pw } ],
+         tls: ( { enabled: true, server_name: $sni }
+                + ( if $prov != "" then { certificate_provider: $prov }
+                    else { certificate_path: $cert, key_path: $key } end ) )
+       }]
+       | if $prov != "" then
+           .certificate_providers = ((.certificate_providers // []) +
+             [ { type: "acme", tag: $prov, domain: [ $domain ], data_directory: $adir, email: $email, provider: $ca } ])
+         else . end' "$AT_CONF" > "$tmp" || { rm -f "$tmp"; warn "写入配置失败"; return 1; }
+
+    if ! "$AT_BIN" check -c "$tmp" >/dev/null 2>&1; then
+        warn "新配置校验失败，已放弃（原配置未改动）："
+        "$AT_BIN" check -c "$tmp" 2>&1 | tail -5 || true
+        rm -f "$tmp"
+        return 1
+    fi
+    cat "$tmp" > "$AT_CONF"
+    chmod 600 "$AT_CONF"
+    rm -f "$tmp"
+
+    at_configure_firewall "$PORT" "$([[ "$TLS_MODE" == "1" ]] && echo 1 || echo 0)"
+
+    if svc_is_stopped "$AT_SERVICE_NAME"; then
+        warn "AnyTLS 当前处于停用状态：节点已写入配置，启用该协议后生效"
+    else
+        systemctl restart "$AT_SERVICE_NAME"
+        sleep 2
+        if ! systemctl is-active --quiet "$AT_SERVICE_NAME"; then
+            warn "sing-box 重启失败，正在回滚配置..."
+            cp -a "$bak" "$AT_CONF"
+            systemctl restart "$AT_SERVICE_NAME" || true
+            return 1
+        fi
+        info "sing-box 已重启，新节点生效 ✔"
+    fi
+
+    n=$(jq '.inbounds | length' "$AT_CONF")
+    box "新节点信息（AnyTLS #${n}）"
+    at_show_node $(( n - 1 ))
+    return 0
+}
+
+# ════════════════════════════════════════════════════════════
+#  5.3  Hysteria 2 多节点（每个额外节点 = 独立实例）
+# ════════════════════════════════════════════════════════════
+hy2_add_node() {
+    step "新增 Hysteria 2 节点"
+    if [[ ! -x "$HY2_BIN" || ! -f "$HY2_CONF" ]]; then
+        warn "尚未安装 Hysteria 2，请先在主菜单选择 [2] 安装"
+        return 1
+    fi
+
+    local n=2
+    while [[ -e "${HY2_CONF_DIR}/config-${n}.yaml" || -e "${HY2_CONF_DIR}/certs-${n}" || -e "${HY2_CONF_DIR}/acme-${n}" ]]; do n=$(( n + 1 )); done
+
+    # 动态作用域：下面这些变量只在本函数及其调用的函数里生效，
+    # 复用原有的 hy2_write_config_* / hy2_write_service / hy2_print_client_info
+    local HY2_CONF="${HY2_CONF_DIR}/config-${n}.yaml"
+    local HY2_SERVICE="/etc/systemd/system/hysteria-server-${n}.service"
+    local HY2_CERT_DIR="${HY2_CONF_DIR}/certs-${n}"
+    local HY2_ACME_DIR="${HY2_CONF_DIR}/acme-${n}"
+    local HY2_CLASH_FILE="/root/clash_hysteria2_${n}.yaml"
+    local HY2_SVC_NAME="hysteria-server-${n}"
+    local HY2_NODE_TAG="-${n}"
+
+    local TLS_MODE DOMAIN="" EMAIL="" ACME_CA="letsencrypt" SNI="" PORT PASSWORD DEF_PASS ca_choice
+    local SERVER_IPV4 SERVER_IPV6 CERT_FILE="" version
+
+    echo "  TLS 证书模式：  [1] ACME 自动申请（需域名 + TCP 80）   [2] 自签名证书"
+    read -rp "  请选择 [1/2]（默认 2）: " TLS_MODE
+    TLS_MODE=${TLS_MODE:-2}
+    SERVER_IPV4=$(hy2_get_ipv4); SERVER_IPV6=$(hy2_get_ipv6)
+
+    if [[ "$TLS_MODE" == "1" ]]; then
+        read -rp "  域名（需已解析到本机）: " DOMAIN
+        [[ -n "$DOMAIN" ]] || { warn "域名不能为空"; return 1; }
+        read -rp "  邮箱: " EMAIL
+        [[ -n "$EMAIL" ]] || { warn "邮箱不能为空"; return 1; }
+        read -rp "  证书机构 [1] Let's Encrypt（默认） [2] ZeroSSL: " ca_choice
+        [[ "${ca_choice:-1}" == "2" ]] && ACME_CA="zerossl" || ACME_CA="letsencrypt"
+        warn "ACME 的 HTTP 验证需要占用 TCP 80；若其它节点正在申请/续期证书，可能短暂冲突"
+    else
+        read -rp "  SNI 域名（默认 bing.com）: " SNI
+        SNI=${SNI:-bing.com}
+        SNI=$(echo "$SNI" | sed -E 's|^https?://||;s|/.*||;s/[[:space:]]//g')
+    fi
+
+    ask_new_port udp 8443
+    PORT=$NEW_PORT
+    DEF_PASS=$(tr -dc 'A-Za-z0-9!@#^&*' </dev/urandom 2>/dev/null | head -c 20 || openssl rand -base64 16 | tr -d '=+/')
+    read -rp "  认证密码（默认随机: ${DEF_PASS}）: " PASSWORD
+    PASSWORD=${PASSWORD:-$DEF_PASS}
+    hy2_ask_limits
+
+    step "写入服务端配置"
+    if [[ "$TLS_MODE" == "1" ]]; then
+        hy2_write_config_acme "$DOMAIN" "$EMAIL" "$PASSWORD" "$PORT" "$ACME_CA"
+    else
+        hy2_gen_selfsigned_cert "$SNI"
+        hy2_write_config_selfsigned "$PASSWORD" "$PORT"
+    fi
+    chmod 600 "$HY2_CONF"
+    if warp_state_has hy2; then
+        { echo ""; warp_hy2_block; } >> "$HY2_CONF"
+        info "已沿用 WARP 出口设置（该节点的出站经 WARP）"
+    fi
+
+    hy2_write_service
+    systemctl daemon-reload
+    fw_open_port "$PORT" udp "Hysteria2-${n}"
+    [[ "$TLS_MODE" == "1" ]] && fw_open_port 80 tcp "Hysteria2-ACME"
+
+    if svc_is_stopped hysteria-server; then
+        warn "Hysteria 2 当前处于停用状态：节点已写入配置，启用该协议后生效"
+    else
+        systemctl enable "$HY2_SVC_NAME" >/dev/null 2>&1 || true
+        systemctl restart "$HY2_SVC_NAME" || warn "服务启动失败: journalctl -u ${HY2_SVC_NAME} -n 50"
+        sleep 2
+    fi
+
+    if [[ "$TLS_MODE" == "1" ]]; then
+        if hy2_wait_for_acme_cert; then CERT_FILE="$HY2_CERT_FOUND"; fi
+    else
+        CERT_FILE="${HY2_CERT_DIR}/server.crt"
+    fi
+    version=$("$HY2_BIN" version 2>/dev/null | awk '/^Version:/{print $2; exit}' || true)
+    hy2_print_client_info "$TLS_MODE" "$DOMAIN" "$PASSWORD" "$PORT" "$SNI" \
+        "$SERVER_IPV4" "$SERVER_IPV6" "${version:-已安装}" "$CERT_FILE"
+    return 0
+}
+
+# 额外 Hysteria 2 节点的查看（复用主节点的查看函数）
+hy2_show_extra_conf() {
+    local f=$1 n
+    n=$(hy2_conf_index "$f")
+    local HY2_CONF="$f"
+    local HY2_CERT_DIR="${HY2_CONF_DIR}/certs-${n}"
+    local HY2_ACME_DIR="${HY2_CONF_DIR}/acme-${n}"
+    local HY2_CLASH_FILE="/root/clash_hysteria2_${n}.yaml"
+    local HY2_SVC_NAME="hysteria-server-${n}"
+    local HY2_NODE_TAG="-${n}"
+    show_hy2_existing_config || true
+    return 0
+}
+
+# 「查看配置」里追加：列出所有额外节点
+show_extra_nodes_all() {
+    local n i f
+    if command -v jq &>/dev/null; then
+        if [[ -f "$RE_XRAY_CONF" ]]; then
+            n=$(jq '.inbounds | length' "$RE_XRAY_CONF" 2>/dev/null || echo 0)
+            for (( i = 1; i < n; i++ )); do
+                box "REALITY 额外节点 #$(( i + 1 ))"
+                re_show_node "$i"
+            done
+        fi
+        if [[ -f "$AT_CONF" ]]; then
+            n=$(jq '.inbounds | length' "$AT_CONF" 2>/dev/null || echo 0)
+            for (( i = 1; i < n; i++ )); do
+                box "AnyTLS 额外节点 #$(( i + 1 ))"
+                at_show_node "$i"
+            done
+        fi
+    fi
+    for f in $(hy2_extra_confs); do
+        hy2_show_extra_conf "$f"
+    done
+    n=0
+    for f in "${PAUSED_DIR}"/re-*.json "${PAUSED_DIR}"/at-*.json; do
+        [[ -f "$f" ]] && n=$(( n + 1 ))
+    done
+    if (( n > 0 )); then
+        echo ""
+        warn "另有 ${n} 个已暂停的 REALITY/AnyTLS 节点（主菜单 [6] → [4] 可恢复）"
+    fi
+    return 0
+}
+
+# ════════════════════════════════════════════════════════════
+#  5.4  单个节点：暂停 / 恢复 / 删除（主节点、额外节点都适用）
+#   REALITY / AnyTLS：暂停 = 把该 inbound 从配置里摘出，存到 /etc/proxy-paused/
+#   Hysteria 2：暂停 = 停止该实例并取消开机自启
+# ════════════════════════════════════════════════════════════
+PAUSED_DIR="/etc/proxy-paused"
+
+hy2_svc_of_conf() {
+    if [[ "$1" == "$HY2_CONF" ]]; then echo "hysteria-server"; else echo "hysteria-server-$(hy2_conf_index "$1")"; fi
+}
+
+# 校验 → 备份 → 写入 → 重启；失败自动回滚。参数: re|at 新配置临时文件
+node_conf_apply() {
+    local kind=$1 tmp=$2 conf svc bak
+    if [[ "$kind" == "re" ]]; then
+        conf="$RE_XRAY_CONF"; svc="xray"
+        if ! "$RE_XRAY_BIN" run -test -config "$tmp" >/dev/null 2>&1; then
+            warn "新配置校验失败，已放弃（原配置未改动）"; rm -f "$tmp"; return 1
+        fi
+    else
+        conf="$AT_CONF"; svc="$AT_SERVICE_NAME"
+        if ! "$AT_BIN" check -c "$tmp" >/dev/null 2>&1; then
+            warn "新配置校验失败，已放弃（原配置未改动）"; rm -f "$tmp"; return 1
+        fi
+    fi
+    bak="${conf}.node.bak"
+    cp -a "$conf" "$bak"
+    cat "$tmp" > "$conf"
+    rm -f "$tmp"
+    if svc_is_stopped "$svc"; then return 0; fi
+    systemctl restart "$svc"; sleep 2
+    if ! systemctl is-active --quiet "$svc"; then
+        warn "${svc} 重启失败，正在回滚配置..."
+        cp -a "$bak" "$conf"; systemctl restart "$svc" || true
+        return 1
+    fi
+    return 0
+}
+
+# 把第 idx 个 inbound 从配置里摘掉；传入 stash 文件则先存档（暂停用）
+inbound_detach() {
+    local kind=$1 idx=$2 stash=${3:-} conf tmp
+    if [[ "$kind" == "re" ]]; then conf="$RE_XRAY_CONF"; else conf="$AT_CONF"; fi
+    if [[ -n "$stash" ]]; then
+        mkdir -p "$PAUSED_DIR"; chmod 700 "$PAUSED_DIR"
+        jq --argjson i "$idx" '{
+              inbound: .inbounds[$i],
+              provider: ( (.inbounds[$i].tls.certificate_provider // "") as $t
+                          | if $t == "" then null
+                            else ((.certificate_providers // []) | map(select(.tag == $t)) | .[0]) end ) }' \
+            "$conf" > "$stash" || { rm -f "$stash"; return 1; }
+        chmod 600 "$stash"
+    fi
+    tmp=$(mktemp)
+    jq --argjson i "$idx" '
+        (.inbounds[$i].tls.certificate_provider // "") as $t
+        | del(.inbounds[$i])
+        | if $t != "" then .certificate_providers |= map(select(.tag != $t)) else . end' \
+        "$conf" > "$tmp" || { rm -f "$tmp"; [[ -n "$stash" ]] && rm -f "$stash"; return 1; }
+    if ! node_conf_apply "$kind" "$tmp"; then
+        [[ -n "$stash" ]] && rm -f "$stash"
+        return 1
+    fi
+    return 0
+}
+
+# 收集全部节点 → NODES 数组，每项: kind|ref|port|state|primary
+#   ref：re/at 运行中=inbound 下标，已暂停=暂存文件；hy2=配置文件路径
+NODES=()
+node_collect() {
+    NODES=()
+    local n i port f b
+    if command -v jq &>/dev/null; then
+        if [[ -f "$RE_XRAY_CONF" ]]; then
+            n=$(jq '.inbounds | length' "$RE_XRAY_CONF" 2>/dev/null || echo 0)
+            for (( i = 0; i < n; i++ )); do
+                port=$(jq -r ".inbounds[$i].port // empty" "$RE_XRAY_CONF")
+                NODES+=("re|${i}|${port}|run|$(( i == 0 ? 1 : 0 ))")
+            done
+        fi
+        if [[ -f "$AT_CONF" ]]; then
+            n=$(jq '.inbounds | length' "$AT_CONF" 2>/dev/null || echo 0)
+            for (( i = 0; i < n; i++ )); do
+                port=$(jq -r ".inbounds[$i].listen_port // empty" "$AT_CONF")
+                NODES+=("at|${i}|${port}|run|$(( i == 0 ? 1 : 0 ))")
+            done
+        fi
+    fi
+    for f in "${PAUSED_DIR}"/re-*.json "${PAUSED_DIR}"/at-*.json; do
+        [[ -f "$f" ]] || continue
+        b=${f##*/}; port=${b#*-}; port=${port%.json}
+        NODES+=("${b%%-*}|${f}|${port}|paused|0")
+    done
+    for f in $(hy2_all_confs); do
+        port=$(sed -nE 's/^listen:[[:space:]]*:([0-9]+).*$/\1/p' "$f" | head -1 || true)
+        if systemctl is-active --quiet "$(hy2_svc_of_conf "$f")" 2>/dev/null; then st=run; else st=paused; fi
+        NODES+=("hy2|${f}|${port}|${st}|$([[ "$f" == "$HY2_CONF" ]] && echo 1 || echo 0)")
+    done
+    return 0
+}
+
+# 暂停 / 恢复。参数: kind ref port state
+node_toggle() {
+    local kind=$1 ref=$2 port=$3 state=$4 svc n tmp stash
+    case "$kind" in
+        hy2)
+            svc=$(hy2_svc_of_conf "$ref")
+            if [[ "$state" == "run" ]]; then
+                systemctl disable --now "$svc" 2>/dev/null || true
+                info "已暂停 Hysteria 2 节点（UDP ${port}）"
+            else
+                systemctl enable --now "$svc" 2>/dev/null || true
+                sleep 2
+                if systemctl is-active --quiet "$svc"; then info "已恢复 Hysteria 2 节点（UDP ${port}）✔"
+                else warn "启动失败: journalctl -u ${svc} -n 30"; fi
+            fi
+            ;;
+        re|at)
+            need_jq || return 1
+            if [[ "$state" == "run" ]]; then
+                if [[ "$kind" == "re" ]]; then n=$(jq '.inbounds | length' "$RE_XRAY_CONF"); else n=$(jq '.inbounds | length' "$AT_CONF"); fi
+                if (( n < 2 )); then
+                    warn "这是该协议当前唯一在运行的节点，无法单独暂停；要停掉整个协议请用主菜单 [7]"
+                    return 1
+                fi
+                inbound_detach "$kind" "$ref" "${PAUSED_DIR}/${kind}-${port}.json" \
+                    && info "已暂停 ${kind^^} 节点（TCP ${port}），配置已存档，可随时恢复" || return 1
+            else
+                stash="$ref"
+                if grep -qx "$port" <<< "$(active_tcp_ports)"; then
+                    warn "TCP ${port} 已被其它节点占用，请先处理冲突再恢复"; return 1
+                fi
+                if at_port_in_use "$port"; then
+                    warn "TCP ${port} 当前被其它程序占用，请先释放端口再恢复"; return 1
+                fi
+                tmp=$(mktemp)
+                if [[ "$kind" == "re" ]]; then
+                    jq --slurpfile s "$stash" '.inbounds += [ $s[0].inbound ]' "$RE_XRAY_CONF" > "$tmp" || { rm -f "$tmp"; return 1; }
+                else
+                    jq --slurpfile s "$stash" '
+                        .inbounds += [ $s[0].inbound ]
+                        | if $s[0].provider != null then
+                            .certificate_providers = (((.certificate_providers // []) | map(select(.tag != $s[0].provider.tag))) + [ $s[0].provider ])
+                          else . end' "$AT_CONF" > "$tmp" || { rm -f "$tmp"; return 1; }
+                fi
+                node_conf_apply "$kind" "$tmp" || return 1
+                rm -f "$stash"
+                info "已恢复 ${kind^^} 节点（TCP ${port}）✔"
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# 删除单个节点。参数: kind ref port state primary
+node_delete() {
+    local kind=$1 ref=$2 port=$3 state=$4 primary=$5
+    local n np cert="" key="" svc conf e en esvc was=0
+    case "$kind" in
+        re|at)
+            if [[ "$state" == "paused" ]]; then
+                rm -f "$ref" "/root/clash_reality_${port}.yaml" "/root/clash_anytls_${port}.yaml"
+                info "已删除已暂停的节点"; return 0
+            fi
+            need_jq || return 1
+            if [[ "$kind" == "re" ]]; then n=$(jq '.inbounds | length' "$RE_XRAY_CONF"); else n=$(jq '.inbounds | length' "$AT_CONF"); fi
+            if (( n < 2 )); then
+                warn "这是该协议唯一在运行的节点；请先恢复其它节点，或用主菜单 [5] 删除整个协议"
+                return 1
+            fi
+            if [[ "$kind" == "at" ]]; then
+                cert=$(jq -r ".inbounds[$ref].tls.certificate_path // empty" "$AT_CONF")
+                key=$(jq -r ".inbounds[$ref].tls.key_path // empty" "$AT_CONF")
+            fi
+            inbound_detach "$kind" "$ref" || return 1
+            if [[ "$kind" == "re" ]]; then
+                rm -f "/root/clash_reality_${port}.yaml"
+                if [[ "$primary" == "1" ]]; then
+                    rm -f "$RE_CLASH_FILE"
+                    np=$(jq -r '.inbounds[0].port // empty' "$RE_XRAY_CONF"); rm -f "/root/clash_reality_${np}.yaml"
+                fi
+            else
+                rm -f "/root/clash_anytls_${port}.yaml"
+                if [[ "$primary" == "1" ]]; then
+                    rm -f "$AT_CLASH_FILE"
+                    np=$(jq -r '.inbounds[0].listen_port // empty' "$AT_CONF"); rm -f "/root/clash_anytls_${np}.yaml"
+                fi
+                # 证书文件不再被任何节点引用时才删除
+                if [[ -n "$cert" ]] && ! grep -qF "\"${cert}\"" "$AT_CONF"; then rm -f "$cert"; fi
+                if [[ -n "$key"  ]] && ! grep -qF "\"${key}\""  "$AT_CONF"; then rm -f "$key";  fi
+            fi
+            fw_close_tcp_port "$port"
+            info "✅ 已删除节点（TCP ${port}）"
+            ;;
+        hy2)
+            conf="$ref"
+            if [[ "$primary" != "1" ]]; then
+                n=$(hy2_conf_index "$conf"); svc="hysteria-server-${n}"
+                systemctl stop "$svc" 2>/dev/null || true
+                systemctl disable "$svc" 2>/dev/null || true
+                rm -f "/etc/systemd/system/${svc}.service" "${SYSTEMD_WANTS_DIR}/${svc}.service"
+                systemctl daemon-reload 2>/dev/null || true
+                systemctl reset-failed "$svc" 2>/dev/null || true
+                rm -rf "$conf" "${HY2_CONF_DIR}/certs-${n}" "${HY2_CONF_DIR}/acme-${n}"
+                rm -f "/root/clash_hysteria2_${n}.yaml"
+            else
+                # 删除第一个节点：把编号最小的额外节点「提升」为主节点
+                e=$(hy2_extra_confs | head -1)
+                [[ -n "$e" ]] || { warn "没有其它 Hysteria 2 节点，无法单独删除；请用主菜单 [5]"; return 1; }
+                en=$(hy2_conf_index "$e"); esvc="hysteria-server-${en}"
+                if systemctl is-active --quiet hysteria-server 2>/dev/null || systemctl is-active --quiet "$esvc" 2>/dev/null; then was=1; fi
+                systemctl stop hysteria-server 2>/dev/null || true
+                systemctl disable --now "$esvc" 2>/dev/null || true
+                (
+                    HY2_CERT_DIR="${HY2_CERT_DIR:-}"; HY2_ACME_DIR="${HY2_ACME_DIR:-}"
+                    hy2_load_paths_from_conf
+                    rm -f "${HY2_CERT_DIR}/server.crt" "${HY2_CERT_DIR}/server.key"
+                )
+                cp -a "$e" "$HY2_CONF"
+                rm -f "/etc/systemd/system/${esvc}.service" "${SYSTEMD_WANTS_DIR}/${esvc}.service" \
+                      "$e" "/root/clash_hysteria2_${en}.yaml" "$HY2_CLASH_FILE"
+                systemctl daemon-reload 2>/dev/null || true
+                systemctl reset-failed "$esvc" 2>/dev/null || true
+                if (( was == 1 )); then
+                    systemctl enable --now hysteria-server 2>/dev/null || true
+                fi
+                info "原第一个节点已删除，节点 #${en} 已接替为主节点（证书目录沿用其原有位置）"
+            fi
+            fw_close_udp_port "$port"
+            info "✅ 已删除节点（UDP ${port}）"
+            ;;
+    esac
+    return 0
+}
+
+manage_single_node() {
+    need_jq || true
+    while true; do
+        clear
+        box "管理单个节点（暂停 / 恢复 / 删除）"
+        node_collect
+        if (( ${#NODES[@]} == 0 )); then
+            warn "没有找到任何节点"; pause_any; return 0
+        fi
+        echo ""
+        local i kind ref port state primary pname stxt c same act sel ans
+        for i in "${!NODES[@]}"; do
+            IFS='|' read -r kind ref port state primary <<< "${NODES[$i]}"
+            case "$kind" in re) pname="REALITY";; at) pname="AnyTLS";; hy2) pname="Hysteria 2";; esac
+            if [[ "$kind" == "hy2" ]]; then proto="UDP"; else proto="TCP"; fi
+            if [[ "$state" == "run" ]]; then stxt="${GREEN}● 运行中${NC}"; else stxt="${YELLOW}○ 已暂停${NC}"; fi
+            printf "    [%d]  %-11s %s %-6s %b%s\n" $(( i + 1 )) "$pname" "$proto" "$port" "$stxt" \
+                "$([[ "$primary" == "1" ]] && echo '  (第一个节点)')"
+        done
+        echo ""
+        echo -e "  ${DIM}暂停 = 保留配置、停止提供服务，可恢复；删除 = 永久移除${NC}"
+        echo -e "  ${DIM}协议只剩一个节点时不能单独暂停/删除（请用主菜单 [7] 停用 或 [5] 删除整个协议）${NC}"
+        echo ""
+        read -rp "  请输入节点编号（0 = 返回）: " sel
+        [[ "$sel" =~ ^[0-9]+$ ]] || return 0
+        (( sel == 0 )) && return 0
+        (( sel >= 1 && sel <= ${#NODES[@]} )) || { warn "无效编号"; sleep 1; continue; }
+        IFS='|' read -r kind ref port state primary <<< "${NODES[$((sel-1))]}"
+
+        same=0
+        for c in "${NODES[@]}"; do [[ "${c%%|*}" == "$kind" ]] && same=$(( same + 1 )); done
+
+        if [[ "$state" == "run" ]]; then act="暂停"; else act="恢复"; fi
+        read -rp "  [1] ${act}  [2] 删除  [0] 取消: " ans
+        case "$ans" in
+            1)
+                if [[ "$state" == "run" && $same -lt 2 ]]; then
+                    warn "该协议只有这一个节点，无法单独暂停；要停整个协议请用主菜单 [7]"
+                else
+                    node_toggle "$kind" "$ref" "$port" "$state" || true
+                fi
+                pause_any ;;
+            2)
+                if (( same < 2 )); then
+                    warn "该协议只有这一个节点，无法单独删除；要删除整个协议请用主菜单 [5]"
+                else
+                    read -rp "  确认永久删除该节点？[y/N]: " c
+                    if [[ "${c:-N}" =~ ^[Yy]$ ]]; then node_delete "$kind" "$ref" "$port" "$state" "$primary" || true; fi
+                fi
+                pause_any ;;
+            *) : ;;
+        esac
+    done
+}
+
+# 彻底删除 Hysteria 2 时，先清掉所有额外实例的服务
+hy2_purge_extras() {
+    local f n st
+    for f in $(hy2_extra_confs); do
+        n=$(hy2_conf_index "$f")
+        st="hysteria-server-${n}"
+        systemctl stop "$st" 2>/dev/null || true
+        systemctl disable "$st" 2>/dev/null || true
+        pkill -f "^${HY2_BIN} server -c ${f}" 2>/dev/null || true
+        rm -f "/etc/systemd/system/${st}.service" "${SYSTEMD_WANTS_DIR}/${st}.service" "/root/clash_hysteria2_${n}.yaml"
+        systemctl reset-failed "$st" 2>/dev/null || true
+    done
+    return 0
+}
+
+# ════════════════════════════════════════════════════════════
+#  5.5  「新增 / 删除节点」菜单
+# ════════════════════════════════════════════════════════════
+node_manage_menu() {
+    while true; do
+        clear
+        box "多节点管理（新增节点 / 暂停 / 恢复 / 删除单个节点）"
+        echo ""
+        echo "    [1]  新增 VLESS + REALITY 节点"
+        echo "    [2]  新增 Hysteria 2 节点"
+        echo "    [3]  新增 AnyTLS 节点"
+        echo "    [4]  管理单个节点（暂停 / 恢复 / 删除）"
+        echo "    [0]  返回主菜单"
+        echo ""
+        local c
+        read -rp "  请选择 [0-4]: " c
+        case "$c" in
+            1) re_add_node  || true; pause_any ;;
+            2) hy2_add_node || true; pause_any ;;
+            3) at_add_node  || true; pause_any ;;
+            4) manage_single_node ;;
+            0|"") return 0 ;;
+            *) warn "无效选项" ; sleep 1 ;;
+        esac
+    done
+}
+
+# ════════════════════════════════════════════════════════════
+#  5.6  启用 / 停用协议
+# ════════════════════════════════════════════════════════════
+proto_services() {
+    local f n
+    case "$1" in
+        re)  if [[ -e "$RE_XRAY_SERVICE" ]]; then echo xray; fi ;;
+        hy2)
+            if [[ -e "$HY2_SERVICE" ]]; then echo hysteria-server; fi
+            for f in $(hy2_extra_confs); do
+                n=$(hy2_conf_index "$f"); echo "hysteria-server-${n}"
+            done
+            ;;
+        at)  if [[ -e "$AT_SERVICE" ]]; then echo "$AT_SERVICE_NAME"; fi ;;
+    esac
+    return 0
+}
+
+# 输出: 运行中 / 已停用 / 异常（已启用但未运行）
+proto_state_text() {
+    local s act=0 en=0 total=0
+    for s in $(proto_services "$1"); do
+        total=$(( total + 1 ))
+        if systemctl is-active  --quiet "$s" 2>/dev/null; then act=$(( act + 1 )); fi
+        if systemctl is-enabled --quiet "$s" 2>/dev/null; then en=$(( en + 1 )); fi
+    done
+    if (( total == 0 )); then echo "未安装"
+    elif (( act == total )); then echo -e "${GREEN}● 运行中${NC}"
+    elif (( act == 0 && en == 0 )); then echo -e "${YELLOW}○ 已停用${NC}"
+    elif (( act == 0 )); then echo -e "${RED}✗ 已启用但未运行${NC}"
+    else echo -e "${YELLOW}◐ 部分运行 (${act}/${total})${NC}"
+    fi
+}
+
+proto_set_enabled() {   # $1=re|hy2|at  $2=on|off
+    local s
+    for s in $(proto_services "$1"); do
+        if [[ "$2" == "off" ]]; then
+            systemctl disable --now "$s" 2>/dev/null || true
+            info "已停用 ${s}（停止运行并取消开机自启）"
+        else
+            systemctl enable --now "$s" 2>/dev/null || true
+            sleep 2
+            if systemctl is-active --quiet "$s" 2>/dev/null; then
+                info "已启用 ${s} ✔"
+            else
+                warn "${s} 启动失败，最近日志："
+                journalctl -u "$s" -n 8 --no-pager 2>/dev/null || true
+            fi
+        fi
+    done
+    return 0
+}
+
+toggle_protocols() {
+    while true; do
+        clear
+        box "启用 / 停用协议"
+        echo ""
+        local key
+        local i=0
+        local -a keys=(re hy2 at)
+        local -a labels=("VLESS + REALITY（Xray）" "Hysteria 2" "AnyTLS（sing-box）")
+        for key in "${keys[@]}"; do
+            printf "    [%d]  %-26s %b\n" $(( i + 1 )) "${labels[$i]}" "$(proto_state_text "$key")"
+            i=$(( i + 1 ))
+        done
+        echo ""
+        echo -e "  ${DIM}停用 = 停止服务 + 取消开机自启（配置与节点保留）；启用 = 开机自启 + 立即启动${NC}"
+        echo -e "  ${DIM}这里是整个协议一起启停；只想暂停某一个节点请用主菜单 [6] → [4]${NC}"
+        echo ""
+        local sel act
+        read -rp "  请选择协议编号（0 = 返回）: " sel
+        case "$sel" in 0|"") return 0 ;; esac
+        [[ "$sel" =~ ^[1-3]$ ]] || { warn "无效选项"; sleep 1; continue; }
+        key=${keys[$((sel-1))]}
+        if [[ -z "$(proto_services "$key")" ]]; then
+            warn "${labels[$((sel-1))]} 尚未安装"; sleep 1.5; continue
+        fi
+        read -rp "  [1] 启用  [2] 停用  [0] 取消: " act
+        case "$act" in
+            1) proto_set_enabled "$key" on ;;
+            2) proto_set_enabled "$key" off ;;
+            *) continue ;;
+        esac
+        pause_any
+    done
+}
+
+# ════════════════════════════════════════════════════════════
+#  5.7  WARP 出口（一键套 WARP）
+#   Xray      → wireguard outbound，并设为默认出站
+#   sing-box  → wireguard endpoint，并设置 route.final
+#   Hysteria2 → 通过本机 wireproxy（SOCKS5 桥）出站：TCP 走 WARP，UDP 仍直连
+#  账号：向 Cloudflare 注册免费 WARP 账号（失败时可导入 wgcf-profile.conf）
+# ════════════════════════════════════════════════════════════
+WARP_DIR="/etc/proxy-warp"
+WARP_ACC="${WARP_DIR}/account.json"
+WARP_STATE="${WARP_DIR}/enabled"
+WARP_BIN="/usr/local/lib/proxy/wireproxy"
+WARP_WP_CONF="${WARP_DIR}/wireproxy.conf"
+WARP_SVC_NAME="proxy-warp"
+WARP_SVC="/etc/systemd/system/${WARP_SVC_NAME}.service"
+WARP_SOCKS_PORT=40000
+WARP_MARK_BEGIN="# >>> proxy-warp >>>"
+WARP_MARK_END="# <<< proxy-warp <<<"
+WARP_EP_HOST=""
+WARP_EP_PORT=2408
+WARP_PRIV=""
+WARP_PUB=""
+WARP_TEST_IP=""
+
+warp_state_has()    { [[ -f "$WARP_STATE" ]] && grep -qx "$1" "$WARP_STATE" 2>/dev/null; }
+warp_state_add()    { mkdir -p "$WARP_DIR"; warp_state_has "$1" || echo "$1" >> "$WARP_STATE"; }
+warp_state_remove() { [[ -f "$WARP_STATE" ]] && sed -i "/^${1}\$/d" "$WARP_STATE"; return 0; }
+warp_acc_get()      { jq -r ".$1 // empty" "$WARP_ACC" 2>/dev/null || true; }
+
+# 生成 WireGuard 密钥对（只依赖 openssl）
+warp_gen_keys() {
+    local pem
+    pem=$(openssl genpkey -algorithm X25519 2>/dev/null) || return 1
+    WARP_PRIV=$(printf '%s\n' "$pem" | openssl pkey -outform DER 2>/dev/null | tail -c 32 | base64 -w0)
+    WARP_PUB=$(printf '%s\n' "$pem" | openssl pkey -pubout -outform DER 2>/dev/null | tail -c 32 | base64 -w0)
+    (( ${#WARP_PRIV} == 44 && ${#WARP_PUB} == 44 ))
+}
+
+# 保存账号。参数: 私钥 对端公钥 v4 v6 reserved("a,b,c") id token
+warp_save_account() {
+    mkdir -p "$WARP_DIR"; chmod 700 "$WARP_DIR"
+    jq -n --arg priv "$1" --arg ppk "$2" --arg v4 "$3" --arg v6 "$4" --arg rsv "$5" \
+          --arg id "${6:-}" --arg token "${7:-}" '
+        { private_key: $priv, peer_public_key: $ppk, v4: $v4, v6: $v6,
+          reserved: ($rsv | split(",") | map(tonumber)), id: $id, token: $token }' > "$WARP_ACC" \
+        || return 1
+    chmod 600 "$WARP_ACC"
+}
+
+warp_register() {
+    need_jq || return 1
+    warp_gen_keys || { warn "WireGuard 密钥生成失败（需要 openssl >= 1.1.0）"; return 1; }
+    local resp tos id token ppk v4 v6 cid rsv="0,0,0"
+    tos=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+    info "向 Cloudflare 注册 WARP 账号..."
+    resp=$(curl -fsS --max-time 20 -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+        -H 'Content-Type: application/json' -H 'User-Agent: okhttp/3.12.1' -H 'CF-Client-Version: a-6.3-1922' \
+        -d "{\"key\":\"${WARP_PUB}\",\"install_id\":\"\",\"fcm_token\":\"\",\"tos\":\"${tos}\",\"type\":\"Android\",\"model\":\"PC\",\"locale\":\"en_US\"}" 2>&1) \
+        || { warn "注册请求失败: ${resp:0:200}"; return 1; }
+    id=$(jq -r '.id // empty' <<< "$resp" 2>/dev/null || true)
+    token=$(jq -r '.token // empty' <<< "$resp" 2>/dev/null || true)
+    ppk=$(jq -r '.config.peers[0].public_key // empty' <<< "$resp" 2>/dev/null || true)
+    v4=$(jq -r '.config.interface.addresses.v4 // empty' <<< "$resp" 2>/dev/null || true)
+    v6=$(jq -r '.config.interface.addresses.v6 // empty' <<< "$resp" 2>/dev/null || true)
+    cid=$(jq -r '.config.client_id // empty' <<< "$resp" 2>/dev/null || true)
+    if [[ -z "$ppk" || -z "$v4" ]]; then
+        warn "注册返回内容异常（可能被 Cloudflare 限流/拦截）: ${resp:0:200}"
+        return 1
+    fi
+    if [[ -n "$cid" ]]; then
+        rsv=$(printf '%s' "$cid" | base64 -d 2>/dev/null | od -An -tu1 | awk '{printf "%s,%s,%s", $1, $2, $3}' || true)
+    fi
+    [[ "$rsv" =~ ^[0-9]+,[0-9]+,[0-9]+$ ]] || rsv="0,0,0"
+    warp_save_account "$WARP_PRIV" "$ppk" "$v4" "$v6" "$rsv" "$id" "$token" || return 1
+    info "✅ WARP 账号已保存到 ${WARP_ACC}"
+}
+
+# 从 wgcf-profile.conf / 标准 WireGuard 配置导入
+warp_import_profile() {
+    need_jq || return 1
+    local f=$1 priv pub addrs v4 v6 rsv=""
+    [[ -f "$f" ]] || { warn "文件不存在: $f"; return 1; }
+    priv=$(sed -nE 's/^[[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*([^[:space:]]+).*/\1/p' "$f" | head -1 || true)
+    pub=$(sed -nE 's/^[[:space:]]*PublicKey[[:space:]]*=[[:space:]]*([^[:space:]]+).*/\1/p' "$f" | head -1 || true)
+    addrs=$(sed -nE 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*(.*)$/\1/p' "$f" | tr ',' '\n' | tr -d ' \r' || true)
+    v4=$(grep -m1 -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' <<< "$addrs" | sed 's|/.*||' || true)
+    v6=$(grep -m1 ':' <<< "$addrs" | sed 's|/.*||' || true)
+    [[ -n "$priv" && -n "$pub" && -n "$v4" ]] || { warn "未能从文件解析出 PrivateKey / PublicKey / Address"; return 1; }
+    read -rp "  Reserved 三个数字（如 12,34,56；没有就直接回车）: " rsv
+    [[ "$rsv" =~ ^[0-9]+,[0-9]+,[0-9]+$ ]] || rsv="0,0,0"
+    warp_save_account "$priv" "$pub" "$v4" "$v6" "$rsv" "" "" || return 1
+    info "✅ 已导入 WARP 账号"
+}
+
+warp_get_account() {
+    if warp_register; then return 0; fi
+    echo ""
+    warn "自动注册失败。可在其它机器/本机用 wgcf 生成 wgcf-profile.conf 后导入。"
+    local p
+    read -rp "  wgcf-profile.conf 的路径（留空 = 放弃）: " p
+    [[ -n "$p" ]] || return 1
+    warp_import_profile "$p"
+}
+
+# 选择 WARP 端点：有 IPv4 用 IPv4，否则用 IPv6
+warp_pick_endpoint() {
+    WARP_EP_PORT=2408
+    if curl -4 -fsS --max-time 5 -o /dev/null https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null; then
+        WARP_EP_HOST="162.159.192.1"
+    else
+        WARP_EP_HOST="2606:4700:d0::a29f:c001"
+    fi
+}
+warp_ep_str() { if [[ "$WARP_EP_HOST" == *:* ]]; then echo "[${WARP_EP_HOST}]:${WARP_EP_PORT}"; else echo "${WARP_EP_HOST}:${WARP_EP_PORT}"; fi; }
+
+# ── wireproxy（SOCKS5 桥）──────────────────────────────────
+warp_install_wireproxy() {
+    [[ -x "$WARP_BIN" ]] && return 0
+    local arch tmp url bin
+    case "$(uname -m)" in
+        x86_64)        arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *) warn "wireproxy 不支持当前架构: $(uname -m)"; return 1 ;;
+    esac
+    url="https://github.com/pufferffish/wireproxy/releases/latest/download/wireproxy_linux_${arch}.tar.gz"
+    info "下载 wireproxy: ${url}"
+    tmp=$(mktemp -d)
+    if ! curl -fL --retry 3 --max-time 120 -o "${tmp}/w.tgz" "$url"; then
+        warn "wireproxy 下载失败"; rm -rf "$tmp"; return 1
+    fi
+    tar -xzf "${tmp}/w.tgz" -C "$tmp" 2>/dev/null || { warn "wireproxy 解压失败"; rm -rf "$tmp"; return 1; }
+    bin=$(find "$tmp" -type f -name wireproxy -print -quit 2>/dev/null || true)
+    [[ -n "$bin" ]] || { warn "压缩包里没有 wireproxy"; rm -rf "$tmp"; return 1; }
+    install -d -m 755 "$(dirname "$WARP_BIN")"
+    install -m 755 "$bin" "$WARP_BIN"
+    rm -rf "$tmp"
+    info "✅ wireproxy 已安装: ${WARP_BIN}"
+}
+
+warp_write_wireproxy_conf() {
+    local priv ppk v4 v6 addr
+    priv=$(warp_acc_get private_key); ppk=$(warp_acc_get peer_public_key)
+    v4=$(warp_acc_get v4); v6=$(warp_acc_get v6)
+    addr="${v4}/32"
+    if [[ -n "$v6" ]]; then addr="${addr}, ${v6}/128"; fi
+    mkdir -p "$WARP_DIR"
+    cat > "$WARP_WP_CONF" <<EOF
+[Interface]
+PrivateKey = ${priv}
+Address = ${addr}
+DNS = 1.1.1.1
+MTU = 1280
+
+[Peer]
+PublicKey = ${ppk}
+Endpoint = $(warp_ep_str)
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+
+[Socks5]
+BindAddress = 127.0.0.1:${WARP_SOCKS_PORT}
+EOF
+    chmod 600 "$WARP_WP_CONF"
+}
+
+warp_bridge_start() {
+    if [[ ! -e "$WARP_SVC" ]] && at_port_in_use "$WARP_SOCKS_PORT"; then
+        warn "本机 TCP ${WARP_SOCKS_PORT} 已被占用，WARP 桥无法监听"
+        return 1
+    fi
+    cat > "$WARP_SVC" <<EOF
+[Unit]
+Description=WARP SOCKS5 bridge (wireproxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=${WARP_BIN} -c ${WARP_WP_CONF}
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "$WARP_SVC_NAME" >/dev/null 2>&1 || true
+    systemctl restart "$WARP_SVC_NAME" || return 1
+    local i
+    for i in 1 2 3 4 5 6; do
+        at_port_in_use "$WARP_SOCKS_PORT" && return 0
+        sleep 1
+    done
+    return 1
+}
+
+warp_bridge_stop() {
+    systemctl disable --now "$WARP_SVC_NAME" 2>/dev/null || true
+    return 0
+}
+
+warp_trace() {
+    curl -fsS --max-time 15 -x "socks5h://127.0.0.1:${WARP_SOCKS_PORT}" \
+        https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true
+}
+
+# 自检：经 wireproxy 访问 cloudflare trace，确认 warp=on|plus
+warp_selftest() {
+    warp_install_wireproxy || return 1
+    warp_write_wireproxy_conf
+    warp_bridge_start || return 1
+    local i t
+    WARP_TEST_IP=""
+    for i in 1 2 3; do
+        t=$(warp_trace)
+        if grep -qE '^warp=(on|plus)' <<< "$t"; then
+            WARP_TEST_IP=$(sed -nE 's/^ip=//p' <<< "$t" | head -1)
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+# ── 各核心的补丁 ───────────────────────────────────────────
+warp_wg_json_xray() {
+    jq -n --arg sk "$(warp_acc_get private_key)" --arg v4 "$(warp_acc_get v4)" --arg v6 "$(warp_acc_get v6)" \
+          --arg pk "$(warp_acc_get peer_public_key)" --arg ep "$(warp_ep_str)" \
+          --argjson rsv "$(jq -c '.reserved // [0,0,0]' "$WARP_ACC")" '
+        { tag: "warp", protocol: "wireguard",
+          settings: {
+            secretKey: $sk,
+            address: ([ ($v4 + "/32"), (if $v6 != "" then ($v6 + "/128") else empty end) ]),
+            peers: [ { publicKey: $pk, allowedIPs: ["0.0.0.0/0", "::/0"], endpoint: $ep } ],
+            mtu: 1280, reserved: $rsv } }'
+}
+
+warp_wg_json_singbox() {
+    jq -n --arg sk "$(warp_acc_get private_key)" --arg v4 "$(warp_acc_get v4)" --arg v6 "$(warp_acc_get v6)" \
+          --arg pk "$(warp_acc_get peer_public_key)" --arg host "$WARP_EP_HOST" --argjson port "$WARP_EP_PORT" \
+          --argjson rsv "$(jq -c '.reserved // [0,0,0]' "$WARP_ACC")" '
+        { type: "wireguard", tag: "warp", mtu: 1280,
+          address: ([ ($v4 + "/32"), (if $v6 != "" then ($v6 + "/128") else empty end) ]),
+          private_key: $sk,
+          peers: [ { address: $host, port: $port, public_key: $pk, allowed_ips: ["0.0.0.0/0", "::/0"], reserved: $rsv } ] }'
+}
+
+warp_patch_xray() {   # on|off
+    local conf="$RE_XRAY_CONF" bak="${RE_XRAY_CONF}.warp.bak" tmp wg
+    [[ -f "$conf" && -x "$RE_XRAY_BIN" ]] || return 0
+    tmp=$(mktemp)
+    if [[ "$1" == "on" ]]; then
+        wg=$(warp_wg_json_xray) || { rm -f "$tmp"; return 1; }
+        jq --argjson wg "$wg" '.outbounds = ([ $wg ] + [ (.outbounds // [])[] | select(.tag != "warp") ])' \
+            "$conf" > "$tmp" || { rm -f "$tmp"; return 1; }
+    else
+        jq '.outbounds = [ (.outbounds // [])[] | select(.tag != "warp") ]' "$conf" > "$tmp" \
+            || { rm -f "$tmp"; return 1; }
+    fi
+    if ! "$RE_XRAY_BIN" run -test -config "$tmp" >/dev/null 2>&1; then
+        warn "Xray 配置校验失败，未修改"; rm -f "$tmp"; return 1
+    fi
+    cp -a "$conf" "$bak"
+    cat "$tmp" > "$conf"; rm -f "$tmp"
+    if svc_is_stopped xray; then return 0; fi
+    systemctl restart xray; sleep 2
+    if ! systemctl is-active --quiet xray; then
+        warn "Xray 重启失败，回滚"; cp -a "$bak" "$conf"; systemctl restart xray || true; return 1
+    fi
+    return 0
+}
+
+warp_patch_singbox() {   # on|off
+    local conf="$AT_CONF" bak="${AT_CONF}.warp.bak" tmp ep
+    [[ -f "$conf" && -x "$AT_BIN" ]] || return 0
+    tmp=$(mktemp)
+    if [[ "$1" == "on" ]]; then
+        ep=$(warp_wg_json_singbox) || { rm -f "$tmp"; return 1; }
+        jq --argjson ep "$ep" '
+            .endpoints = ([ (.endpoints // [])[] | select(.tag != "warp") ] + [ $ep ])
+            | .route = ((.route // {}) + { final: "warp" })' "$conf" > "$tmp" || { rm -f "$tmp"; return 1; }
+    else
+        jq '
+            .endpoints = [ (.endpoints // [])[] | select(.tag != "warp") ]
+            | (if (.endpoints | length) == 0 then del(.endpoints) else . end)
+            | (if .route then (.route |= del(.final)) else . end)
+            | (if (.route // {}) == {} then del(.route) else . end)' "$conf" > "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    if ! "$AT_BIN" check -c "$tmp" >/dev/null 2>&1; then
+        warn "sing-box 配置校验失败，未修改："
+        "$AT_BIN" check -c "$tmp" 2>&1 | tail -5 || true
+        rm -f "$tmp"; return 1
+    fi
+    cp -a "$conf" "$bak"
+    cat "$tmp" > "$conf"; chmod 600 "$conf"; rm -f "$tmp"
+    if svc_is_stopped "$AT_SERVICE_NAME"; then return 0; fi
+    systemctl restart "$AT_SERVICE_NAME"; sleep 2
+    if ! systemctl is-active --quiet "$AT_SERVICE_NAME"; then
+        warn "sing-box 重启失败，回滚"; cp -a "$bak" "$conf"; systemctl restart "$AT_SERVICE_NAME" || true; return 1
+    fi
+    return 0
+}
+
+# Hysteria 2：追加 / 移除 outbounds + acl 段（TCP → WARP，UDP 直连）
+warp_hy2_block() {
+    cat <<EOF
+${WARP_MARK_BEGIN}
+outbounds:
+  - name: warp
+    type: socks5
+    socks5:
+      addr: 127.0.0.1:${WARP_SOCKS_PORT}
+  - name: direct
+    type: direct
+    direct:
+      mode: auto
+
+acl:
+  inline:
+    - direct(all, udp/*)
+    - warp(all)
+${WARP_MARK_END}
+EOF
+}
+
+warp_patch_hy2() {   # on|off
+    local f svc bak ok=0 was_active
+    for f in $(hy2_all_confs); do
+        if [[ "$f" == "$HY2_CONF" ]]; then svc="hysteria-server"; else svc="hysteria-server-$(hy2_conf_index "$f")"; fi
+        bak="${f}.warp.bak"
+        cp -a "$f" "$bak"
+        was_active=0
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then was_active=1; fi
+        sed -i "\|${WARP_MARK_BEGIN}|,\|${WARP_MARK_END}|d" "$f"
+        sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$f"    # 去掉文件末尾多余空行
+        if [[ "$1" == "on" ]]; then
+            if grep -qE '^(outbounds|acl):' "$f"; then
+                warn "${f} 里已有自定义 outbounds/acl，跳过（请手动处理）"
+                cp -a "$bak" "$f"; continue
+            fi
+            { echo ""; warp_hy2_block; } >> "$f"
+        fi
+        if (( was_active == 1 )); then
+            systemctl restart "$svc"; sleep 2
+            if ! systemctl is-active --quiet "$svc"; then
+                warn "${svc} 重启失败，回滚"; cp -a "$bak" "$f"; systemctl restart "$svc" || true; ok=1; continue
+            fi
+        fi
+    done
+    return $ok
+}
+
+warp_enable() {
+    need_jq || return 1
+    command -v openssl &>/dev/null || { warn "缺少 openssl"; return 1; }
+    local any=0 hy2_ok=0
+    if [[ ! -f "$RE_XRAY_CONF" && ! -f "$AT_CONF" && ! -f "$HY2_CONF" ]]; then
+        warn "未检测到任何已安装的协议，请先安装节点"; return 1
+    fi
+    if [[ ! -f "$WARP_ACC" ]]; then
+        warp_get_account || { warn "没有可用的 WARP 账号，已取消"; return 1; }
+    fi
+    warp_pick_endpoint
+    step "自检：WARP 通道连通性（端点 $(warp_ep_str)）"
+    if ! warp_selftest; then
+        warn "WARP 通道不通（未能得到 warp=on）。为避免把节点流量引进黑洞，未改动任何节点配置。"
+        warn "排查: journalctl -u ${WARP_SVC_NAME} -n 30   / 换账号（菜单 [4]）/ 检查 UDP 2408 是否被封"
+        warp_bridge_stop
+        return 1
+    fi
+    info "✅ WARP 通道正常，出口 IP: ${WARP_TEST_IP:-未知}"
+
+    if [[ -f "$RE_XRAY_CONF" ]]; then
+        any=1
+        step "REALITY（Xray）套 WARP"
+        if warp_patch_xray on; then warp_state_add re; info "✔ 完成"; else warn "REALITY 未能套 WARP"; fi
+    fi
+    if [[ -f "$AT_CONF" ]]; then
+        any=1
+        step "AnyTLS（sing-box）套 WARP"
+        if warp_patch_singbox on; then warp_state_add at; info "✔ 完成"; else warn "AnyTLS 未能套 WARP"; fi
+    fi
+    if [[ -f "$HY2_CONF" ]]; then
+        any=1
+        step "Hysteria 2 套 WARP（TCP 经 WARP，UDP 仍直连）"
+        if warp_patch_hy2 on; then warp_state_add hy2; hy2_ok=1; info "✔ 完成"; else warn "Hysteria 2 未能套 WARP"; fi
+    fi
+    if (( hy2_ok == 0 )); then warp_bridge_stop; fi
+    (( any == 1 )) || warn "没有可处理的协议"
+    echo ""
+    info "验证方法：用客户端连上节点后访问 https://www.cloudflare.com/cdn-cgi/trace ，看到 warp=on 即成功"
+    return 0
+}
+
+warp_disable() {
+    need_jq || return 1
+    if [[ -f "$RE_XRAY_CONF" ]] && jq -e '.outbounds[]? | select(.tag == "warp")' "$RE_XRAY_CONF" &>/dev/null; then
+        warp_patch_xray off && info "REALITY 已恢复直连" || warn "REALITY 恢复失败"
+    fi
+    if [[ -f "$AT_CONF" ]] && jq -e '.endpoints[]? | select(.tag == "warp")' "$AT_CONF" &>/dev/null; then
+        warp_patch_singbox off && info "AnyTLS 已恢复直连" || warn "AnyTLS 恢复失败"
+    fi
+    local hy2_confs
+    hy2_confs=$(hy2_all_confs)
+    if [[ -n "$hy2_confs" ]] && grep -qs -- "$WARP_MARK_BEGIN" $hy2_confs; then
+        warp_patch_hy2 off && info "Hysteria 2 已恢复直连" || warn "Hysteria 2 恢复失败"
+    fi
+    rm -f "$WARP_STATE"
+    warp_bridge_stop
+    info "✅ WARP 出口已关闭（账号保留，可随时重新开启）"
+}
+
+warp_purge_all() {
+    warp_disable || true
+    rm -rf "$WARP_DIR" "$WARP_SVC" "$WARP_BIN"
+    systemctl daemon-reload 2>/dev/null || true
+    info "✅ 已删除 WARP 账号、wireproxy 与相关服务"
+}
+
+warp_status() {
+    local t ip4
+    echo ""
+    printf "  %-22s %s\n" "WARP 账号" "$([[ -f "$WARP_ACC" ]] && echo "已注册/导入" || echo "无")"
+    printf "  %-22s %s\n" "REALITY 出口"   "$(warp_state_has re  && echo '● 经 WARP' || echo '直连')"
+    printf "  %-22s %s\n" "Hysteria 2 出口" "$(warp_state_has hy2 && echo '● 经 WARP（仅 TCP）' || echo '直连')"
+    printf "  %-22s %s\n" "AnyTLS 出口"    "$(warp_state_has at  && echo '● 经 WARP' || echo '直连')"
+    ip4=$(hy2_get_ipv4 2>/dev/null || true)
+    printf "  %-22s %s\n" "本机直连 IPv4" "${ip4:-未知}"
+    if systemctl is-active --quiet "$WARP_SVC_NAME" 2>/dev/null; then
+        t=$(warp_trace)
+        printf "  %-22s %s\n" "WARP 桥出口 IP" "$(sed -nE 's/^ip=//p' <<< "$t" | head -1)  ($(grep -E '^warp=' <<< "$t" | head -1))"
+    fi
+}
+
+warp_menu() {
+    while true; do
+        clear
+        box "WARP 出口（一键套 WARP）"
+        warp_status
+        echo ""
+        echo "    [1]  一键开启 WARP 出口（所有已安装协议）"
+        echo "    [2]  关闭 WARP 出口（恢复直连）"
+        echo "    [3]  重新注册 / 导入 WARP 账号"
+        echo "    [4]  彻底清理（关闭 + 删除账号与 wireproxy）"
+        echo "    [0]  返回主菜单"
+        echo ""
+        local c
+        read -rp "  请选择 [0-4]: " c
+        case "$c" in
+            1) warp_enable || true; pause_any ;;
+            2) warp_disable || true; pause_any ;;
+            3) need_jq && { rm -f "$WARP_ACC"; warp_get_account || true; }; pause_any ;;
+            4) warp_purge_all || true; pause_any ;;
+            0|"") return 0 ;;
+            *) warn "无效选项"; sleep 1 ;;
+        esac
+    done
+}
 
 # ════════════════════════════════════════════════════════════
 #  入口
