@@ -8,9 +8,18 @@
 #    另含：[4] 查看已有节点配置   [5] 删除已搭建的节点（卸载并清理干净）
 #  所有节点搭建完成后，都会输出 Clash / Mihomo 订阅格式配置（单节点），
 #  并保存到 /root/clash_*.yaml
-#  支持系统：Ubuntu 20.04/22.04/24.04 | Debian 10/11/12
+#  支持系统：Ubuntu 20.04/22.04/24.04 | Debian 10/11/12 | Alpine 3.x
 #            CentOS / Rocky / AlmaLinux（仅 Hysteria 2 / AnyTLS）
+#  服务管理：systemd 或 OpenRC（自动检测）
 # ============================================================
+
+# Alpine 默认没有 bash：若被 sh 调用，先安装 bash 再用 bash 重新执行
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v apk >/dev/null 2>&1; then
+        apk add --no-cache -q bash >/dev/null 2>&1 || true
+    fi
+    exec bash "$0" "$@"
+fi
 
 set -euo pipefail
 
@@ -25,6 +34,211 @@ warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 step()  { echo -e "\n${BOLD}${CYAN}▶  $*${NC}"; }
 hr()    { echo -e "${DIM}──────────────────────────────────────────────────────${NC}"; }
+
+# ════════════════════════════════════════════════════════════
+#  系统检测（发行版族 + 服务管理器 systemd / OpenRC）
+# ════════════════════════════════════════════════════════════
+OS_ID=""; OS_VER=""; OS_FAMILY=""; INIT_SYS=""
+
+detect_system() {
+    [[ -f /etc/os-release ]] || error "无法检测操作系统（缺少 /etc/os-release）"
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_VER="${VERSION_ID:-}"
+    case "$OS_ID" in
+        ubuntu|debian)                          OS_FAMILY=debian ;;
+        alpine)                                 OS_FAMILY=alpine ;;
+        centos|rhel|rocky|almalinux|fedora|ol)  OS_FAMILY=rhel ;;
+        *) error "不支持的系统：${OS_ID}" ;;
+    esac
+
+    if [[ -d /run/systemd/system ]] && command -v systemctl &>/dev/null; then
+        INIT_SYS=systemd
+    elif command -v rc-service &>/dev/null; then
+        INIT_SYS=openrc
+    else
+        error "未检测到 systemd 或 OpenRC，无法管理服务"
+    fi
+    info "系统: ${OS_ID} ${OS_VER}  |  发行族: ${OS_FAMILY}  |  服务管理: ${INIT_SYS}"
+}
+
+# ════════════════════════════════════════════════════════════
+#  包管理抽象（apt / apk / dnf|yum）
+# ════════════════════════════════════════════════════════════
+pkg_update() {
+    case "$OS_FAMILY" in
+        debian) apt-get update -qq ;;
+        alpine) apk update -q ;;
+        *)      return 0 ;;
+    esac
+}
+
+pkg_install() {
+    case "$OS_FAMILY" in
+        debian) DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" ;;
+        alpine) apk add --no-cache -q "$@" ;;
+        rhel)
+            if command -v dnf &>/dev/null; then dnf install -y -q "$@"
+            else yum install -y -q "$@"; fi ;;
+    esac
+}
+
+pkg_clean() {
+    case "$OS_FAMILY" in
+        debian) apt-get clean >/dev/null 2>&1 || true
+                dpkg --configure -a >/dev/null 2>&1 || true ;;
+        alpine) rm -rf /var/cache/apk/* ;;
+        *) : ;;
+    esac
+}
+
+# Alpine 基础工具：coreutils 提供 readlink -m / sleep 小数等，findutils 提供 find -quit，
+# procps 提供 free / pkill，iproute2 提供 ip 命令（公网 IP 回退探测用）
+ensure_base_tools() {
+    [[ "$OS_FAMILY" == alpine ]] || return 0
+    info "检查 Alpine 基础工具（curl jq openssl tar coreutils findutils procps iproute2）..."
+    apk add --no-cache -q bash curl jq openssl tar ca-certificates \
+        coreutils findutils procps iproute2 \
+        || warn "基础工具安装失败，后续步骤可能异常"
+}
+
+# 没有 clear 命令时的兜底（部分最小化 Alpine 没有 ncurses）
+command -v clear &>/dev/null || clear() { printf '\033[H\033[2J'; }
+
+# ════════════════════════════════════════════════════════════
+#  服务管理兼容层：同名函数覆盖 systemctl / journalctl
+#  systemd 下直接透传；OpenRC 下翻译为 rc-service / rc-update
+# ════════════════════════════════════════════════════════════
+systemctl() {
+    if [[ "$INIT_SYS" == systemd ]]; then command systemctl "$@"; return; fi
+
+    local action="${1:-}" a name="" now=0
+    shift || true
+    for a in "$@"; do
+        case "$a" in
+            --now) now=1 ;;
+            --*)   ;;
+            *)     name="${a%.service}" ;;
+        esac
+    done
+
+    case "$action" in
+        daemon-reload|reset-failed) return 0 ;;
+        start|stop|restart|status)  rc-service "$name" "$action" ;;
+        enable)
+            rc-update add "$name" default >/dev/null 2>&1 || true
+            if (( now )); then rc-service "$name" start; fi ;;
+        disable)
+            if (( now )); then rc-service "$name" stop >/dev/null 2>&1 || true; fi
+            rc-update del "$name" default >/dev/null 2>&1 || true ;;
+        is-active)  rc-service "$name" status >/dev/null 2>&1 ;;
+        is-enabled)
+            rc-update show default 2>/dev/null \
+                | awk -F'|' -v n="$name" '{ gsub(/[ \t]/, "", $1); if ($1 == n) f = 1 } END { exit !f }' ;;
+        list-unit-files) [[ -e "/etc/init.d/${name}" ]] ;;
+        *) warn "OpenRC 下未实现的 systemctl 操作：${action}"; return 1 ;;
+    esac
+}
+
+# journalctl -u NAME [-n N] [-f]：OpenRC 下读取 /var/log/NAME.log
+journalctl() {
+    if [[ "$INIT_SYS" == systemd ]]; then command journalctl "$@"; return; fi
+
+    local a prev="" unit="" lines=50 follow=0
+    for a in "$@"; do
+        case "$prev" in
+            -u) unit="${a%.service}" ;;
+            -n) lines="$a" ;;
+        esac
+        if [[ "$a" == -f ]]; then follow=1; fi
+        prev="$a"
+    done
+    local lf="/var/log/${unit}.log"
+    if [[ -z "$unit" || ! -f "$lf" ]]; then
+        warn "未找到服务日志：${lf}"
+        return 1
+    fi
+    if (( follow )); then tail -n "$lines" -f "$lf"; else tail -n "$lines" "$lf"; fi
+}
+
+# 服务单元路径
+svc_unit_path() {
+    local n=${1%.service}
+    if [[ "$INIT_SYS" == systemd ]]; then
+        echo "/etc/systemd/system/${n}.service"
+    else
+        echo "/etc/init.d/${n}"
+    fi
+}
+
+# 删除服务单元（含开机自启记录与日志）
+svc_remove_unit() {
+    local n=${1%.service}
+    if [[ "$INIT_SYS" == openrc ]]; then
+        rc-update del "$n" default >/dev/null 2>&1 || true
+        rm -f "/var/log/${n}.log"
+    fi
+    rm -f "$(svc_unit_path "$n")" "/etc/systemd/system/multi-user.target.wants/${n}.service"
+}
+
+# 生成服务单元
+#   参数: 服务名 描述 工作目录 可执行文件 启动参数
+svc_write_unit() {
+    local name=${1%.service} desc=$2 wdir=$3 bin=$4 args=$5 path
+    path=$(svc_unit_path "$name")
+    mkdir -p "$(dirname "$path")"
+
+    if [[ "$INIT_SYS" == systemd ]]; then
+        cat > "$path" <<EOF
+[Unit]
+Description=${desc}
+After=network.target nss-lookup.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${wdir}
+ExecStart=${bin} ${args}
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    else
+        cat > "$path" <<EOF
+#!/sbin/openrc-run
+# 由 proxy 安装脚本生成（OpenRC / supervise-daemon）
+name="${name}"
+description="${desc}"
+command="${bin}"
+command_args="${args}"
+directory="${wdir}"
+pidfile="/run/${name}.pid"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+rc_ulimit="-n 1048576"
+output_log="/var/log/${name}.log"
+error_log="/var/log/${name}.log"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+        chmod 755 "$path"
+    fi
+}
+
+# 启动时检测系统
+detect_system
+
+# ════════════════════════════════════════════════════════════
+#  变量 / 通用辅助
+# ════════════════════════════════════════════════════════════
 
 # Install a stable command so the script can be started with: proxy
 PROXY_COMMAND="/usr/local/bin/proxy"
@@ -278,6 +492,7 @@ clash_emit() {
 #  必须 root
 # ════════════════════════════════════════════════════════════
 [[ $EUID -ne 0 ]] && error "请使用 root 用户运行此脚本，或使用 sudo bash $0"
+ensure_base_tools
 install_proxy_command
 
 # ════════════════════════════════════════════════════════════
@@ -611,47 +826,43 @@ show_existing_configs() {
 # ╚══════════════════════════════════════════════════════════╝
 
 # ────────────────────────────────────────────────────────────
-#  检测系统（仅 Ubuntu / Debian）
+#  检测系统（REALITY 支持 Ubuntu / Debian / Alpine）
 # ────────────────────────────────────────────────────────────
 re_detect_os() {
-    if [[ -f /etc/os-release ]]; then
-        source /etc/os-release
-        OS_ID="${ID}"
-        OS_VER="${VERSION_ID}"
-    else
-        error "无法检测操作系统，仅支持 Ubuntu/Debian"
-    fi
-    case "${OS_ID}" in
-        ubuntu|debian) info "检测到系统：${OS_ID} ${OS_VER}" ;;
-        *) error "REALITY 脚本仅支持 Ubuntu / Debian，当前系统：${OS_ID}" ;;
+    case "$OS_FAMILY" in
+        debian|alpine) info "检测到系统：${OS_ID} ${OS_VER}（服务管理：${INIT_SYS}）" ;;
+        *) error "REALITY 脚本仅支持 Ubuntu / Debian / Alpine，当前系统：${OS_ID}" ;;
     esac
 }
 
 # ────────────────────────────────────────────────────────────
 #  安装依赖（REALITY）
-#  注意：第三方 apt 源（如已失效的 Caddy 源）导致 apt-get update
-#  返回非零时，不应中断安装，继续使用现有缓存即可。
+#  注意：第三方 apt 源（如已失效的 Caddy 源）导致更新返回非零时，
+#  不应中断安装，继续使用现有缓存即可。
 # ────────────────────────────────────────────────────────────
 re_install_deps() {
     step "安装依赖"
 
-    local i update_ok=0
+    local i ok=0
     for i in 1 2; do
-        if apt-get update -qq; then
-            update_ok=1
-            break
-        fi
-        warn "apt-get update 返回错误（可能是某个第三方源失效，如 Caddy / Cloudsmith），重试 (${i}/2)..."
+        if pkg_update; then ok=1; break; fi
+        warn "软件源更新返回错误（可能是某个第三方源失效），重试 (${i}/2)..."
         sleep 2
     done
-    (( update_ok == 0 )) && warn "apt-get update 存在失败的源，已忽略，继续使用现有软件包缓存安装依赖"
+    (( ok == 0 )) && warn "软件源更新存在失败，已忽略，继续使用现有缓存安装依赖"
 
-    apt-get install -y -qq curl wget unzip jq qrencode 2>/dev/null || \
-        apt-get install -y -qq curl wget unzip jq \
-        || error "依赖安装失败。若是 apt 源问题，可临时禁用出错的源后重试，例如: mv /etc/apt/sources.list.d/caddy-stable.list /root/ && apt-get update"
+    local -a pkgs
+    if [[ "$OS_FAMILY" == alpine ]]; then
+        pkgs=(bash curl wget unzip jq qrencode openssl ca-certificates coreutils)
+    else
+        pkgs=(curl wget unzip jq qrencode openssl)
+    fi
+    pkg_install "${pkgs[@]}" 2>/dev/null \
+        || pkg_install curl unzip jq openssl \
+        || error "依赖安装失败。若是 apt 源问题，可临时禁用出错的源后重试；Alpine 请检查 /etc/apk/repositories"
 
     local c
-    for c in curl unzip jq; do
+    for c in curl unzip jq openssl; do
         command -v "$c" &>/dev/null || error "缺少依赖命令: ${c}"
     done
     info "依赖安装完成"
@@ -698,26 +909,8 @@ re_install_xray() {
         || warn "geosite.dat 下载失败（可忽略）"
 
     mkdir -p /usr/local/etc/xray /var/log/xray
-    cat > /etc/systemd/system/xray.service <<'SYSTEMD'
-[Unit]
-Description=Xray Service
-Documentation=https://github.com/xtls
-After=network.target nss-lookup.target
-
-[Service]
-User=root
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
-Restart=on-failure
-RestartPreventExitStatus=23
-LimitNPROC=10000
-LimitNOFILE=1000000
-
-[Install]
-WantedBy=multi-user.target
-SYSTEMD
+    svc_write_unit xray "Xray Service" "/usr/local/etc/xray" "$XRAY_BIN" \
+        "run -config /usr/local/etc/xray/config.json"
 
     systemctl daemon-reload
     [[ -x "${XRAY_BIN}" ]] || error "Xray 安装失败"
@@ -872,7 +1065,7 @@ re_configure_firewall() {
             warn "未检测到 ip6tables，若服务器有公网 IPv6，请手动放行 IPv6 的 ${RE_PORT}/tcp"
         fi
     else
-        warn "未检测到防火墙，请手动放行端口 ${RE_PORT}"
+        warn "未检测到防火墙，请手动放行端口 ${RE_PORT}（Alpine 可执行 apk add iptables 后重试）"
     fi
 }
 
@@ -1046,7 +1239,7 @@ install_reality() {
 HY2_BIN="/usr/local/bin/hysteria"
 HY2_CONF_DIR="/etc/hysteria"
 HY2_CONF="${HY2_CONF_DIR}/config.yaml"
-HY2_SERVICE="/etc/systemd/system/hysteria-server.service"
+HY2_SERVICE="$(svc_unit_path hysteria-server)"
 HY2_SVC_NAME="hysteria-server"      # 额外节点会在函数内临时覆盖
 HY2_NODE_TAG=""                     # Clash 节点名后缀（额外节点用）
 
@@ -1144,7 +1337,8 @@ hy2_get_ipv4() {
     ip=$(curl -4 -fsSL --max-time 6 https://api.ipify.org   2>/dev/null) ||
     ip=$(curl -4 -fsSL --max-time 6 https://ifconfig.me     2>/dev/null) ||
     ip=$(curl -4 -fsSL --max-time 6 https://icanhazip.com   2>/dev/null) ||
-    ip=$(hostname -I | awk '{print $1}') || true
+    ip=$(ip -4 addr show scope global 2>/dev/null \
+            | awk '/inet /{ sub(/\/.*/, "", $2); print $2; exit }') || true
     echo "${ip}"
 }
 
@@ -1161,12 +1355,22 @@ hy2_get_ipv6() {
 
 # ────────────────────────────────────────────────────────────
 #  CPU 架构 → hysteria 下载后缀
+#  amd64-avx 版按 x86-64-v3 微架构编译，需要 AVX / AVX2 / BMI1 / BMI2 / FMA / MOVBE 全部支持，
+#  只检测 avx 不足以保证能运行，因此逐项校验，任一缺失则使用通用 amd64 版
 # ────────────────────────────────────────────────────────────
 hy2_get_arch() {
     local m; m=$(uname -m)
     case "$m" in
         x86_64)
-            grep -q avx /proc/cpuinfo 2>/dev/null && echo "amd64-avx" || echo "amd64" ;;
+            local flags f
+            flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true)
+            for f in avx avx2 bmi1 bmi2 fma movbe; do
+                if ! grep -qw "$f" <<< "$flags"; then
+                    echo "amd64"
+                    return 0
+                fi
+            done
+            echo "amd64-avx" ;;
         aarch64|arm64)  echo "arm64"  ;;
         armv7*|armv6*)  echo "armv7"  ;;
         s390x)          echo "s390x"  ;;
@@ -1187,11 +1391,10 @@ hy2_get_latest_version() {
 }
 
 # ────────────────────────────────────────────────────────────
-#  安装系统依赖（Hysteria 2，支持 apt/dnf/yum）
-# ────────────────────────────────────────────────────────────
 #  低内存环境（如 96M 的 LXC 容器）辅助函数
 #  在 LXC 中 swapon 常因宿主机限制而失败（Operation not permitted），
 #  这里静默尝试，失败就跳过，不影响主流程。
+# ────────────────────────────────────────────────────────────
 HY2_TMP_SWAP="/swapfile_re_tmp"
 hy2_try_swap() {
     command -v free &>/dev/null || return 0
@@ -1220,83 +1423,87 @@ hy2_cleanup_swap() {
     rm -f "$HY2_TMP_SWAP"
 }
 
-# 单个包安装，带重试；失败时清一次 apt 缓存再试一次，降低内存/磁盘压力
+# 单个包安装（函数名保留以兼容旧调用；按发行版自动选择 apt / apk / dnf）
 hy2_apt_install_one() {
     local pkg="$1" required="${2:-1}" i
-    command -v "$pkg" &>/dev/null && return 0   # 已存在同名命令，跳过（如 curl/openssl）
+    command -v "$pkg" &>/dev/null && return 0
 
     for i in 1 2; do
-        if DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg"; then
-            return 0
-        fi
+        if pkg_install "$pkg"; then return 0; fi
         warn "安装 ${pkg} 失败（可能是内存不足被系统杀死），清理缓存后重试 (${i}/2)..."
-        apt-get clean &>/dev/null || true
-        dpkg --configure -a &>/dev/null || true
+        pkg_clean
         sleep 2
     done
 
     if [[ "$required" == "1" ]]; then
         return 1
-    else
-        warn "${pkg} 安装失败，已跳过（非必需，脚本继续）"
-        return 0
     fi
+    warn "${pkg} 安装失败，已跳过（非必需，脚本继续）"
+    return 0
 }
 
 hy2_install_deps() {
     step "安装依赖（curl openssl xxd）"
-    if command -v apt-get &>/dev/null; then
+
+    if [[ "$OS_FAMILY" == debian || "$OS_FAMILY" == alpine ]]; then
         hy2_try_swap
 
-        local i update_ok=0
+        local i ok=0
         for i in 1 2 3; do
-            apt-get update -qq && { update_ok=1; break; }
-            warn "apt-get update 失败，重试 (${i}/3)..."
+            if pkg_update; then ok=1; break; fi
+            warn "软件源更新失败，重试 (${i}/3)..."
             sleep 2
         done
-        (( update_ok == 0 )) && warn "apt-get update 多次失败，尝试使用现有缓存继续安装"
+        (( ok == 0 )) && warn "软件源更新多次失败，尝试使用现有缓存继续安装"
 
-        # 分开装，而不是一条命令装三个：单次内存峰值更低，
-        # 某一个包被 OOM 杀死也不会连累其余两个。
         local fail=0
         hy2_apt_install_one curl    1 || fail=1
         hy2_apt_install_one openssl 1 || fail=1
-        # xxd 属于 vim-common 包体，体积较大；装不上不影响核心功能，降级为非必需
+        # xxd 体积较大且非核心功能，装不上时降级为非必需（有 python3 回退）
         hy2_apt_install_one xxd     0 || true
 
         hy2_cleanup_swap
 
         if (( fail == 1 )); then
-            local missing=()
-            command -v curl    &>/dev/null || missing+=("curl")
-            command -v openssl &>/dev/null || missing+=("openssl")
-            error "依赖安装失败，仍缺少: ${missing[*]}。常见原因：内存不足被系统杀死 / 网络无法访问软件源 / 磁盘空间不足。可尝试手动执行: apt-get update && apt-get install -y ${missing[*]}"
+            error "依赖安装失败，请手动安装 curl 与 openssl 后重试（Alpine: apk add curl openssl）"
         fi
-
-        command -v xxd &>/dev/null && info "依赖已就绪：curl / openssl / xxd" \
-            || warn "依赖已就绪：curl / openssl（xxd 缺失，若后续步骤报错缺少 xxd，可手动安装: apt-get install -y xxd）"
-    elif command -v dnf &>/dev/null; then
-        dnf install -y -q curl openssl vim-common 2>/dev/null || \
-        dnf install -y -q curl openssl
-    elif command -v yum &>/dev/null; then
-        yum install -y -q curl openssl vim-common 2>/dev/null || \
-        yum install -y -q curl openssl
+        if command -v xxd &>/dev/null; then
+            info "依赖已就绪：curl / openssl / xxd"
+        else
+            warn "依赖已就绪：curl / openssl（xxd 缺失，将使用 python3 回退）"
+        fi
     else
-        warn "无法自动安装依赖，请确保 curl / openssl / xxd 已安装"
+        pkg_install curl openssl vim-common 2>/dev/null || pkg_install curl openssl
     fi
 }
 
 # ────────────────────────────────────────────────────────────
 #  下载 Hysteria 2 二进制
+#  以「能否实际运行」为准：标志检测通过也可能运行失败（如虚拟化环境屏蔽指令），
+#  失败则回退到通用 amd64 版本
 # ────────────────────────────────────────────────────────────
-hy2_download() {
+# 仅负责下载到 HY2_BIN，不做运行检测
+_hy2_fetch() {
     local version=$1 arch=$2
     local url="https://github.com/apernet/hysteria/releases/download/${version}/hysteria-linux-${arch}"
-    step "下载 Hysteria 2 ${version} (${arch})"
     info "URL: ${url}"
-    curl -fL --progress-bar -o "$HY2_BIN" "$url" \
-        || error "下载失败，请检查网络连接或手动下载: ${url}"
+    curl -fL --progress-bar -o "$HY2_BIN" "$url" || return 1
     chmod +x "$HY2_BIN"
+}
+
+hy2_download() {
+    local version=$1 arch=$2
+    step "下载 Hysteria 2 ${version} (${arch})"
+    _hy2_fetch "$version" "$arch" \
+        || error "下载失败，请检查网络连接"
+
+    if ! "$HY2_BIN" version &>/dev/null && [[ "$arch" != "amd64" ]]; then
+        warn "${arch} 版本无法在此 CPU 上运行，回退到通用 amd64 版本"
+        _hy2_fetch "$version" amd64 || error "通用版本下载失败"
+    fi
+
+    "$HY2_BIN" version &>/dev/null \
+        || error "Hysteria 无法在此机器上运行，请确认 CPU 架构（x86_64 / arm64）"
     info "✅ 二进制已安装至 ${HY2_BIN}"
 }
 
@@ -1493,27 +1700,11 @@ EOF
 }
 
 # ────────────────────────────────────────────────────────────
-#  写入 systemd 服务单元
+#  写入服务单元（systemd / OpenRC 自动选择）
 # ────────────────────────────────────────────────────────────
 hy2_write_service() {
-    cat > "$HY2_SERVICE" <<EOF
-[Unit]
-Description=Hysteria 2 Server
-Documentation=https://v2.hysteria.network/
-After=network.target nss-lookup.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=${HY2_CONF_DIR}
-ExecStart=${HY2_BIN} server -c ${HY2_CONF}
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    svc_write_unit "$HY2_SVC_NAME" "Hysteria 2 Server" "$HY2_CONF_DIR" "$HY2_BIN" \
+        "server -c ${HY2_CONF}"
 }
 
 # ────────────────────────────────────────────────────────────
@@ -1957,7 +2148,7 @@ install_hysteria2() {
     systemctl start hysteria-server
 
     # ── 等待服务完全就绪 ─────────────────────────────────────
-    # 自签名模式：等待 systemd 确认服务 active
+    # 自签名模式：等待服务 active
     # ACME 模式：额外等待证书申请完成，再输出配置信息
     local CERT_FILE=""
     if [[ "$TLS_MODE" == "1" ]]; then
@@ -1981,7 +2172,7 @@ install_hysteria2() {
             sleep 1; (( ++waited ))
         done
         if systemctl is-active --quiet hysteria-server; then
-            info "systemd 服务已启动"
+            info "服务已启动"
         else
             warn "服务启动可能失败，请查看日志: journalctl -u ${HY2_SVC_NAME:-hysteria-server} -f"
         fi
@@ -2002,7 +2193,7 @@ AT_DIR="/etc/anytls-box"
 AT_BIN="${AT_DIR}/sing-box"
 AT_CONF="${AT_DIR}/config.json"
 AT_SERVICE_NAME="anytls-box"
-AT_SERVICE="/etc/systemd/system/${AT_SERVICE_NAME}.service"
+AT_SERVICE="$(svc_unit_path "$AT_SERVICE_NAME")"
 AT_WANTS_LINK="/etc/systemd/system/multi-user.target.wants/${AT_SERVICE_NAME}.service"
 AT_DOMAIN_RE='^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
 
@@ -2158,7 +2349,7 @@ at_do_uninstall() {
     systemctl stop    "$AT_SERVICE_NAME" 2>/dev/null || true
     systemctl disable "$AT_SERVICE_NAME" 2>/dev/null || true
     pkill -f "^${AT_BIN} run" 2>/dev/null || true
-    rm -f "$AT_SERVICE" "$AT_WANTS_LINK"
+    svc_remove_unit "$AT_SERVICE_NAME"
     systemctl daemon-reload 2>/dev/null || true
     systemctl reset-failed "$AT_SERVICE_NAME" 2>/dev/null || true
 
@@ -2232,44 +2423,41 @@ at_get_latest_version() {
 
 at_install_deps() {
     step "安装依赖（curl openssl tar jq qrencode）"
-    if command -v apt-get &>/dev/null; then
+
+    if [[ "$OS_FAMILY" == debian || "$OS_FAMILY" == alpine ]]; then
         hy2_try_swap
 
-        local i update_ok=0
+        local i ok=0
         for i in 1 2 3; do
-            apt-get update -qq && { update_ok=1; break; }
-            warn "apt-get update 失败，重试 (${i}/3)..."
+            if pkg_update; then ok=1; break; fi
+            warn "软件源更新失败，重试 (${i}/3)..."
             sleep 2
         done
-        (( update_ok == 0 )) && warn "apt-get update 多次失败，尝试使用现有缓存继续安装"
+        (( ok == 0 )) && warn "软件源更新多次失败，尝试使用现有缓存继续安装"
 
         local fail=0
-        hy2_apt_install_one curl            1 || fail=1
-        hy2_apt_install_one openssl         1 || fail=1
-        hy2_apt_install_one tar             1 || fail=1
-        [[ -s /etc/ssl/certs/ca-certificates.crt ]] || hy2_apt_install_one ca-certificates 0 || true
-        hy2_apt_install_one jq              0 || true
-        hy2_apt_install_one qrencode        0 || true
+        hy2_apt_install_one curl    1 || fail=1
+        hy2_apt_install_one openssl 1 || fail=1
+        hy2_apt_install_one tar     1 || fail=1
+        if [[ ! -s /etc/ssl/certs/ca-certificates.crt ]]; then
+            hy2_apt_install_one ca-certificates 0 || true
+        fi
+        hy2_apt_install_one jq       0 || true
+        hy2_apt_install_one qrencode 0 || true
 
         hy2_cleanup_swap
 
         if (( fail == 1 )); then
-            error "依赖安装失败，请手动执行: apt-get update && apt-get install -y curl openssl tar"
+            error "依赖安装失败，请检查软件源与网络后重试"
         fi
-    elif command -v dnf &>/dev/null || command -v yum &>/dev/null; then
-        local pm="dnf"
-        command -v dnf &>/dev/null || pm="yum"
-        "$pm" install -y -q curl openssl tar ca-certificates \
-            || error "依赖安装失败，请手动执行: ${pm} install -y curl openssl tar"
-        "$pm" install -y -q jq qrencode 2>/dev/null \
-            || warn "jq / qrencode 未能安装（可选，只影响配置摘要与二维码显示）"
     else
-        warn "无法自动安装依赖，请确保 curl / openssl / tar 已安装"
+        pkg_install curl openssl tar ca-certificates 2>/dev/null || error "依赖安装失败"
+        pkg_install jq qrencode 2>/dev/null || warn "jq / qrencode 未能安装（可选）"
     fi
 
     local c
     for c in curl openssl tar; do
-        command -v "$c" &>/dev/null || error "缺少依赖命令: ${c}"
+        command -v "$c" &>/dev/null || error "缺少依赖命令：${c}"
     done
     info "依赖已就绪"
 }
@@ -2283,7 +2471,10 @@ at_download() {
     mkdir -p "$AT_DIR"
     tmp=$(mktemp -d)
     # 先用 glibc 版，跑不起来（极老/特殊系统）再退回静态链接的 musl 版
-    for variant in glibc musl; do
+    # Alpine 使用 musl libc，直接选 musl 版
+    local -a variants=(glibc musl)
+    if [[ "$OS_FAMILY" == alpine ]]; then variants=(musl); fi
+    for variant in "${variants[@]}"; do
         pkg="sing-box-${version}-linux-${arch}-${variant}.tar.gz"
         info "URL: ${base}/${pkg}"
         if curl -fL --retry 3 --progress-bar -o "${tmp}/sb.tar.gz" "${base}/${pkg}" \
@@ -2432,27 +2623,11 @@ EOF
 }
 
 # ────────────────────────────────────────────────────────────
-#  写入 systemd 服务单元
+#  写入服务单元（systemd / OpenRC 自动选择）
 # ────────────────────────────────────────────────────────────
 at_write_service() {
-    cat > "$AT_SERVICE" <<EOF
-[Unit]
-Description=AnyTLS Server (sing-box)
-Documentation=https://sing-box.sagernet.org/configuration/inbound/anytls/
-After=network.target nss-lookup.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=${AT_DIR}
-ExecStart=${AT_BIN} run -c ${AT_CONF} -D ${AT_DIR}
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    svc_write_unit "$AT_SERVICE_NAME" "AnyTLS Server (sing-box)" "$AT_DIR" "$AT_BIN" \
+        "run -c ${AT_CONF} -D ${AT_DIR}"
 }
 
 # ────────────────────────────────────────────────────────────
@@ -2486,7 +2661,7 @@ at_configure_firewall() {
             info "iptables 已放行端口 ${p}/tcp（重启后失效，如需持久化请自行保存规则）"
         done
     else
-        warn "未检测到防火墙，请手动放行端口 ${ports[*]}"
+        warn "未检测到防火墙，请手动放行端口 ${ports[*]}（Alpine 可执行 apk add iptables 后重试）"
     fi
     warn "如果云服务商控制台有安全组/防火墙，请同时放行 TCP ${ports[*]}"
 }
@@ -2855,8 +3030,6 @@ install_anytls() {
     echo -e "  ${DIM}基于 TCP + TLS；UDP 通过 UDP over TCP 转发（不是原生 UDP）${NC}"
     echo ""
 
-    command -v systemctl &>/dev/null || error "本脚本依赖 systemd，当前系统未检测到 systemctl"
-
     # ── 已安装检测 ──────────────────────────────────────────
     if at_is_installed; then
         echo ""
@@ -3005,7 +3178,7 @@ install_anytls() {
         || error "服务启动失败，请执行 journalctl -u ${AT_SERVICE_NAME} -n 50 查看日志"
 
     # ── 等待服务就绪 ─────────────────────────────────────────
-    # 自签名模式：确认 systemd 状态为 active
+    # 自签名模式：确认服务 active
     # ACME 模式：额外等待证书申请完成，再输出配置信息
     local waited=0
     while (( waited < 10 )); do
@@ -3015,7 +3188,7 @@ install_anytls() {
     done
     sleep 1
     if systemctl is-active --quiet "$AT_SERVICE_NAME"; then
-        info "systemd 服务已启动"
+        info "服务已启动"
     else
         warn "服务启动可能失败，请查看日志: journalctl -u ${AT_SERVICE_NAME} -f"
     fi
@@ -3049,7 +3222,7 @@ RE_XRAY_CONF_DIR="/usr/local/etc/xray"
 RE_XRAY_CONF="${RE_XRAY_CONF_DIR}/config.json"
 RE_XRAY_SHARE_DIR="/usr/local/share/xray"
 RE_XRAY_LOG_DIR="/var/log/xray"
-RE_XRAY_SERVICE="/etc/systemd/system/xray.service"
+RE_XRAY_SERVICE="$(svc_unit_path xray)"
 RE_XRAY_INFO="/root/xray_reality_client.txt"
 SYSTEMD_WANTS_DIR="/etc/systemd/system/multi-user.target.wants"
 
@@ -3168,6 +3341,7 @@ re_purge() {
             rm -rf "$t"
         fi
     done
+    svc_remove_unit xray
     rm -f /root/clash_reality_*.yaml "${PAUSED_DIR}"/re-*.json
     systemctl daemon-reload 2>/dev/null || true
     systemctl reset-failed xray 2>/dev/null || true
@@ -3184,7 +3358,7 @@ re_purge() {
 hy2_purge() {
     pkill -f "^${HY2_BIN} server" 2>/dev/null || true
     hy2_do_uninstall        # 内部会读回并清理自定义证书目录、Clash 配置文件
-    rm -f "${SYSTEMD_WANTS_DIR}/hysteria-server.service"
+    svc_remove_unit hysteria-server
     systemctl reset-failed hysteria-server 2>/dev/null || true
     purge_verify "Hysteria 2" "$HY2_BIN" "$HY2_SERVICE" "${SYSTEMD_WANTS_DIR}/hysteria-server.service" \
         "$HY2_CONF_DIR" "/var/log/hysteria" "$HY2_CLASH_FILE" \
@@ -3331,7 +3505,7 @@ delete_nodes() {
         esac
     done
     echo ""
-    echo -e "  ${DIM}不会动：apt 装的 curl/jq 等通用依赖、proxy 快捷命令、80 端口的放行规则${NC}"
+    echo -e "  ${DIM}不会动：apt/apk 装的 curl/jq 等通用依赖、proxy 快捷命令、80 端口的放行规则${NC}"
     hr
     local ans
     read -rp "  确认删除以上内容？此操作不可恢复 [y/N]: " ans
@@ -3367,27 +3541,10 @@ delete_nodes() {
 #   · 额外节点：
 #       REALITY → Xray config.json 里追加 inbound（同一进程）
 #       AnyTLS  → sing-box config.json 里追加 inbound（同一进程）
-#       Hy2     → 独立实例：/etc/hysteria/config-N.yaml + hysteria-server-N.service
+#       Hy2     → 独立实例：/etc/hysteria/config-N.yaml + hysteria-server-N 服务
 #   · 所有对现有配置的修改都是：备份 → 修改 → 校验 → 重启 → 失败自动回滚
 
 pause_any() { local _; read -rp "按回车继续..." _ || true; }
-
-need_jq() {
-    command -v jq &>/dev/null && return 0
-    info "安装 jq ..."
-    if command -v apt-get &>/dev/null; then
-        apt-get install -y -qq jq >/dev/null 2>&1 || true
-    elif command -v dnf &>/dev/null; then
-        dnf install -y -q jq >/dev/null 2>&1 || true
-    elif command -v yum &>/dev/null; then
-        yum install -y -q jq >/dev/null 2>&1 || true
-    fi
-    if ! command -v jq &>/dev/null; then
-        warn "缺少 jq，无法继续（请手动安装: apt-get install -y jq）"
-        return 1
-    fi
-    return 0
-}
 
 # ────────────────────────────────────────────────────────────
 #  端口 / 防火墙
@@ -3828,7 +3985,6 @@ hy2_add_node() {
     # 动态作用域：下面这些变量只在本函数及其调用的函数里生效，
     # 复用原有的 hy2_write_config_* / hy2_write_service / hy2_print_client_info
     local HY2_CONF="${HY2_CONF_DIR}/config-${n}.yaml"
-    local HY2_SERVICE="/etc/systemd/system/hysteria-server-${n}.service"
     local HY2_CERT_DIR="${HY2_CONF_DIR}/certs-${n}"
     local HY2_ACME_DIR="${HY2_CONF_DIR}/acme-${n}"
     local HY2_CLASH_FILE="/root/clash_hysteria2_${n}.yaml"
@@ -4019,7 +4175,7 @@ inbound_detach() {
 NODES=()
 node_collect() {
     NODES=()
-    local n i port f b
+    local n i port f b st
     if command -v jq &>/dev/null; then
         if [[ -f "$RE_XRAY_CONF" ]]; then
             n=$(jq '.inbounds | length' "$RE_XRAY_CONF" 2>/dev/null || echo 0)
@@ -4148,7 +4304,7 @@ node_delete() {
                 n=$(hy2_conf_index "$conf"); svc="hysteria-server-${n}"
                 systemctl stop "$svc" 2>/dev/null || true
                 systemctl disable "$svc" 2>/dev/null || true
-                rm -f "/etc/systemd/system/${svc}.service" "${SYSTEMD_WANTS_DIR}/${svc}.service"
+                svc_remove_unit "$svc"
                 systemctl daemon-reload 2>/dev/null || true
                 systemctl reset-failed "$svc" 2>/dev/null || true
                 rm -rf "$conf" "${HY2_CONF_DIR}/certs-${n}" "${HY2_CONF_DIR}/acme-${n}"
@@ -4167,8 +4323,8 @@ node_delete() {
                     rm -f "${HY2_CERT_DIR}/server.crt" "${HY2_CERT_DIR}/server.key"
                 )
                 cp -a "$e" "$HY2_CONF"
-                rm -f "/etc/systemd/system/${esvc}.service" "${SYSTEMD_WANTS_DIR}/${esvc}.service" \
-                      "$e" "/root/clash_hysteria2_${en}.yaml" "$HY2_CLASH_FILE"
+                svc_remove_unit "$esvc"
+                rm -f "$e" "/root/clash_hysteria2_${en}.yaml" "$HY2_CLASH_FILE"
                 systemctl daemon-reload 2>/dev/null || true
                 systemctl reset-failed "$esvc" 2>/dev/null || true
                 if (( was == 1 )); then
@@ -4193,7 +4349,7 @@ manage_single_node() {
             warn "没有找到任何节点"; pause_any; return 0
         fi
         echo ""
-        local i kind ref port state primary pname stxt c same act sel ans
+        local i kind ref port state primary pname stxt c same act sel ans proto
         for i in "${!NODES[@]}"; do
             IFS='|' read -r kind ref port state primary <<< "${NODES[$i]}"
             case "$kind" in re) pname="REALITY";; at) pname="AnyTLS";; hy2) pname="Hysteria 2";; esac
@@ -4247,7 +4403,8 @@ hy2_purge_extras() {
         systemctl stop "$st" 2>/dev/null || true
         systemctl disable "$st" 2>/dev/null || true
         pkill -f "^${HY2_BIN} server -c ${f}" 2>/dev/null || true
-        rm -f "/etc/systemd/system/${st}.service" "${SYSTEMD_WANTS_DIR}/${st}.service" "/root/clash_hysteria2_${n}.yaml"
+        svc_remove_unit "$st"
+        rm -f "/root/clash_hysteria2_${n}.yaml"
         systemctl reset-failed "$st" 2>/dev/null || true
     done
     return 0
@@ -4382,7 +4539,7 @@ WARP_STATE="${WARP_DIR}/enabled"
 WARP_BIN="/usr/local/lib/proxy/wireproxy"
 WARP_WP_CONF="${WARP_DIR}/wireproxy.conf"
 WARP_SVC_NAME="proxy-warp"
-WARP_SVC="/etc/systemd/system/${WARP_SVC_NAME}.service"
+WARP_SVC="$(svc_unit_path "$WARP_SVC_NAME")"
 WARP_SOCKS_PORT=40000
 WARP_MARK_BEGIN="# >>> proxy-warp >>>"
 WARP_MARK_END="# <<< proxy-warp <<<"
@@ -4538,22 +4695,8 @@ warp_bridge_start() {
         warn "本机 TCP ${WARP_SOCKS_PORT} 已被占用，WARP 桥无法监听"
         return 1
     fi
-    cat > "$WARP_SVC" <<EOF
-[Unit]
-Description=WARP SOCKS5 bridge (wireproxy)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${WARP_BIN} -c ${WARP_WP_CONF}
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    svc_write_unit "$WARP_SVC_NAME" "WARP SOCKS5 bridge (wireproxy)" "$WARP_DIR" "$WARP_BIN" \
+        "-c ${WARP_WP_CONF}"
     systemctl daemon-reload
     systemctl enable "$WARP_SVC_NAME" >/dev/null 2>&1 || true
     systemctl restart "$WARP_SVC_NAME" || return 1
@@ -4735,7 +4878,7 @@ warp_enable() {
     step "自检：WARP 通道连通性（端点 $(warp_ep_str)）"
     if ! warp_selftest; then
         warn "WARP 通道不通（未能得到 warp=on）。为避免把节点流量引进黑洞，未改动任何节点配置。"
-        warn "排查: journalctl -u ${WARP_SVC_NAME} -n 30   / 换账号（菜单 [4]）/ 检查 UDP 2408 是否被封"
+        warn "排查: journalctl -u ${WARP_SVC_NAME} -n 30   / 换账号（菜单 [3]）/ 检查 UDP 2408 是否被封"
         warp_bridge_stop
         return 1
     fi
@@ -4783,7 +4926,8 @@ warp_disable() {
 
 warp_purge_all() {
     warp_disable || true
-    rm -rf "$WARP_DIR" "$WARP_SVC" "$WARP_BIN"
+    svc_remove_unit "$WARP_SVC_NAME"
+    rm -rf "$WARP_DIR" "$WARP_BIN"
     systemctl daemon-reload 2>/dev/null || true
     info "✅ 已删除 WARP 账号、wireproxy 与相关服务"
 }
